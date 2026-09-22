@@ -92,6 +92,10 @@ on:
         type: boolean
         required: false
         default: true
+      rocm-arch:
+        description: 'Override ROCM_ARCH for every component, e.g. "gfx1010" or "gfx803;gfx1010". Leave empty for the docker-bake.hcl default (gfx803).'
+        required: false
+        default: ''
       pytorch-ref:
         description: 'Override PYTORCH_REF. Leave empty for the docker-bake.hcl default.'
         required: false
@@ -125,6 +129,7 @@ jobs:
     secrets: inherit
     with:
       component: rocr-clr
+      rocm-arch: ${{ inputs.rocm-arch }}
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
 
@@ -138,6 +143,7 @@ jobs:
     secrets: inherit
     with:
       component: rocblas
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-rocr-clr-image: true
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
@@ -152,6 +158,7 @@ jobs:
     secrets: inherit
     with:
       component: miopen
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-rocr-clr-image: true
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
@@ -166,6 +173,7 @@ jobs:
     secrets: inherit
     with:
       component: rocsolver
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-rocblas-image: true
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
@@ -183,6 +191,7 @@ jobs:
     secrets: inherit
     with:
       component: migraphx
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-rocblas-image: true
       with-miopen-image: true
       with-rocsolver-image: true
@@ -199,6 +208,7 @@ jobs:
     secrets: inherit
     with:
       component: pytorch
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-migraphx-image: true
       pytorch-ref: ${{ inputs.pytorch-ref }}
       # TensorTopK.hip at -O3 pushes clang's AMDGPU backend to about 20GB of RSS
@@ -219,6 +229,7 @@ jobs:
     secrets: inherit
     with:
       component: torchvision
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-pytorch-image: true
       torchvision-ref: ${{ inputs.torchvision-ref }}
       no-cache: ${{ inputs.no-cache }}
@@ -234,6 +245,7 @@ jobs:
     secrets: inherit
     with:
       component: torchaudio
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-pytorch-image: true
       torchaudio-ref: ${{ inputs.torchaudio-ref }}
       no-cache: ${{ inputs.no-cache }}
@@ -249,6 +261,7 @@ jobs:
     secrets: inherit
     with:
       component: ort
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-migraphx-image: true
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
@@ -267,6 +280,7 @@ jobs:
     secrets: inherit
     with:
       component: vllm
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-pytorch-image: true
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
@@ -282,6 +296,7 @@ jobs:
     secrets: inherit
     with:
       component: triton
+      rocm-arch: ${{ inputs.rocm-arch }}
       no-cache: ${{ inputs.no-cache }}
       debug: ${{ inputs.debug }}
 
@@ -308,6 +323,7 @@ jobs:
     secrets: inherit
     with:
       component: final
+      rocm-arch: ${{ inputs.rocm-arch }}
       with-rocr-clr-image: true
       with-rocblas-image: true
       with-miopen-image: true

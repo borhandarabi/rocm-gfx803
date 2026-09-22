@@ -19,6 +19,15 @@ sh /patches/rocblas/tensile-gfx803-fp16-nond16.sh "$ROOT"
 cp /patches/rocblas/r9nano_Cijk_Ailk_Bljk_HB.yaml \
     "$SRC/library/src/blas3/Tensile/Logic/asm_full/r9nano/"
 
+# gfx1010 (navi10, RX 5700 XT) has no officially-tuned Tensile logic either;
+# only generate/install it when it's actually one of the requested archs, so
+# a plain gfx803 build's output and timing are unaffected.
+case "$ARCH" in
+    *gfx1010*)
+        sh /patches/rocblas/gfx1010-navi10-tensile-logic.sh "$ROOT"
+        ;;
+esac
+
 jobs="$(resolve_build_jobs)"
 echo "rocBLAS build: arch $ARCH, $jobs parallel jobs"
 cd "$SRC"
