@@ -51,7 +51,10 @@ variable "PACKAGES" {
   }
 }
 
-variable "ROCM_ARCH" { default = "gfx803" }
+# Default build includes both gfx803 and gfx1010. The compiler still receives the
+# semicolon-separated list needed by ROCm, while image and cache tags use a
+# sanitized version that keeps Docker tags valid.
+variable "ROCM_ARCH" { default = "gfx803;gfx1010" }
 
 # Build line. Intermediate images are tagged :gfx803-rocm10 rather than :gfx803,
 # because :gfx803 is what this repo published before the main line moved to 10.0.
@@ -70,7 +73,7 @@ variable "RELEASE_TAG" { default = "rocm10.0" }
 variable "DATE" { default = "" }
 
 # ---------------------------------------------------------------------------
-# Build cache
+# Registry and naming
 # ---------------------------------------------------------------------------
 
 # Exporting registry cache needs write access to the packages, which a local bake
@@ -177,6 +180,10 @@ variable "WITH_VLLM_IMAGE"        { default = "false" }
 # Derived values
 # ---------------------------------------------------------------------------
 
+variable "ROCM_ARCH_TAG" {
+  default = replace(replace(replace(ROCM_ARCH, ";", "-"), ",", "-"), " ", "")
+}
+
 function "pkg" {
   params = [component]
   result = "${REGISTRY}/${OWNER}/${PACKAGES[component]}"
@@ -184,12 +191,12 @@ function "pkg" {
 
 function "image" {
   params = [component]
-  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}"
+  result = "${pkg(component)}:${ROCM_ARCH_TAG}-${LINE}"
 }
 
 function "cache_ref" {
   params = [component]
-  result = "${pkg(component)}:cache-${ROCM_ARCH}-${LINE}"
+  result = "${pkg(component)}:cache-${ROCM_ARCH_TAG}-${LINE}"
 }
 
 # pytorch, torchvision, torchaudio, ort, triton and vllm each carry a full build
@@ -205,7 +212,7 @@ function "cache_ref" {
 # it, so what final pulls has to be the wheel-only image.
 function "wheels_image" {
   params = [component]
-  result = "${pkg(component)}:${ROCM_ARCH}-${LINE}-wheels"
+  result = "${pkg(component)}:${ROCM_ARCH_TAG}-${LINE}-wheels"
 }
 
 function "cache_from" {
@@ -615,9 +622,9 @@ target "final" {
   labels = labels("final")
   tags = concat(
     [
-      "${pkg("final")}:latest-${ROCM_ARCH}",
-      "${pkg("final")}:${RELEASE_TAG}-${ROCM_ARCH}",
+      "${pkg("final")}:latest-${ROCM_ARCH_TAG}",
+      "${pkg("final")}:${RELEASE_TAG}-${ROCM_ARCH_TAG}",
     ],
-    DATE != "" ? ["${pkg("final")}:${DATE}-${ROCM_ARCH}"] : [],
+    DATE != "" ? ["${pkg("final")}:${DATE}-${ROCM_ARCH_TAG}"] : [],
   )
 }
