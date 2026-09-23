@@ -55,8 +55,24 @@ built_size="$(stat -c%s "$built_real" 2>/dev/null || echo 0)"
 rm -rf "$SRC/build"
 
 echo "Verifying the $ARCH Tensile library is present in /opt/rocm..."
-if ! find -L /opt/rocm -iname "*TensileLibrary*${ARCH}*" | grep -q .; then
-    echo "FATAL: /opt/rocm has no $ARCH Tensile library after the copy." >&2
+# Tensile writes one lazy-load library file per architecture -- e.g.
+# TensileLibrary_lazy_gfx803.dat and TensileLibrary_lazy_gfx1010.dat side by
+# side -- never a single file whose name contains the whole semicolon-joined
+# $ARCH string. Check each requested arch individually, or a multi-arch build
+# always fails this even when every arch's library is genuinely present.
+missing=""
+old_ifs="$IFS"
+IFS=';'
+for one_arch in $ARCH; do
+    IFS="$old_ifs"
+    if ! find -L /opt/rocm -iname "*TensileLibrary*${one_arch}*" | grep -q .; then
+        missing="$missing $one_arch"
+    fi
+    IFS=';'
+done
+IFS="$old_ifs"
+if [ -n "$missing" ]; then
+    echo "FATAL: /opt/rocm has no Tensile library for:$missing after the copy." >&2
     exit 1
 fi
 
