@@ -82,6 +82,18 @@ kernel that does NOT carry `REFERENCE-amdkfd-gfx7-8-queue-size-writeback`, and i
 must not be combined with `graph-replay-queue-size-cap.patch`. With it,
 `graph-replay-batch-chunk-deadlock.patch` is not needed.
 
+Host CPU without AVX2: PyTorch's own CPU kernels dispatch at runtime
+(`CPU_CAPABILITY`) and fall back cleanly on such a host, but two AVX-only
+libraries with no such fallback do not. `scripts/build/pytorch.sh` builds
+PyTorch with `USE_HIPSPARSELT=0 USE_XNNPACK=0`, and `scripts/build/final-rocm.sh`
+removes the base image's own prebuilt `libhipsparselt.so*` outright (gfx803 has
+no structured-sparsity hardware for it to use anyway). Without both, a no-AVX2
+host can hit `trap invalid opcode ... in libhipsparselt.so` — a crash, not a
+clean "unsupported" error, because that library has no ISA fallback of its own.
+No other component built here passes `-march=native` or an AVX-specific flag;
+GPU-targeted `--offload-arch=gfx803` compilation is unaffected by the host
+CPU's ISA either way.
+
 ### vLLM on gfx803
 
 The gfx803 vLLM hard fork lives at `vllm/` (repo root, the 10.0 line). It targets

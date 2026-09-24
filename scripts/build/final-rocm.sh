@@ -82,3 +82,31 @@ if ! strings /opt/rocm/lib/libgfx803_sgemm_shim.so | grep -q "f16-map-nm"; then
     exit 1
 fi
 echo "OK: the SGEMM shim carries the fp16 mapping fix."
+
+# hipSPARSELt: carried forward untouched from the base image (this repo never
+# builds it), and it targets MI-series structured sparsity, a feature gfx803
+# does not have -- so it is pure dead weight on this card, never functionally
+# useful. AMD's prebuilt copy is compiled with unconditional AVX2 host-side
+# code and no CPU_CAPABILITY-style runtime fallback, unlike PyTorch's own CPU
+# kernels, so any process that dlopens it on a host whose CPU lacks AVX2
+# receives an unrecoverable SIGILL trap deep inside the library instead of a
+# clean "unsupported" error (see the reported crash: `trap invalid opcode ...
+# in libhipsparselt.so`). scripts/build/pytorch.sh already builds PyTorch with
+# USE_HIPSPARSELT=0, which stops PyTorch itself from linking or probing it, but
+# the base image's copy is still on disk and any other component (or a future
+# torch rebuild without that flag) can still dlopen it. Removing the files here
+# is what actually makes that impossible: a caller that hard-requires the
+# library now gets a clean, immediate "cannot open shared object file" instead
+# of a trap that can appear mid-run, and every caller here already treats
+# hipSPARSELt as optional.
+hipsparselt_removed=0
+for f in /opt/rocm/lib/libhipsparselt* /opt/rocm/core-*/lib/libhipsparselt*; do
+    [ -e "$f" ] || continue
+    rm -f "$f"
+    hipsparselt_removed=1
+done
+if [ "$hipsparselt_removed" = "1" ]; then
+    echo "OK: removed the base image's AVX2-only libhipsparselt (unused on gfx803, no CPU fallback)."
+else
+    echo "OK: no libhipsparselt present to remove (already absent from this base image)."
+fi
