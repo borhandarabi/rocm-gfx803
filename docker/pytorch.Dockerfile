@@ -24,6 +24,12 @@ COPY --from=migraphx /opt/rocm /opt/rocm
 RUN --mount=type=bind,source=scripts/gfx803-line.sh,target=/gfx803-line \
     /gfx803-line verify /opt/rocm "${GFX803_LINE}"
 
+# Remove all traces of hipSPARSELt (libs, headers, CMake configs)
+# so PyTorch's build system cleanly fails to find and link it.
+RUN set -eux; \
+    find -L /opt/rocm -name '*hipsparselt*' -exec rm -rf {} + || true; \
+    ldconfig || true
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build build-essential pkg-config ccache \
         libopenblas-dev libdrm-dev \
