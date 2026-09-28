@@ -1,0 +1,373 @@
+The hipcub unique, run-length-encode and prefix-scan path is broken on gfx1010.
+On gfx1010 only, 1-D unique and unique_consecutive sort with the native
+sort, compact first-of-run positions with at::nonzero, derive inverse indices by
+binary search over those positions, and compute counts with a small kernel.
+unique(dim=...) and unique_consecutive(dim=...) keep PyTorch's row sort and
+ordering, then select unique rows from row-compare flags compacted the same way.
+
+Apply gfx1010-nonzero-hipcub-select first; without it at::nonzero still goes
+through the broken hipcub select on gfx1010.
+
+Gated at runtime on gcnArchName starting with "gfx1010".
+
+NOT YET RE-VERIFIED ON REAL HARDWARE: applies to ROCm/pytorch release/2.14; not built or run on a gfx1010 card.
+
+diff --git a/aten/src/ATen/native/cuda/Unique.cu b/aten/src/ATen/native/cuda/Unique.cu
+index 7ad9f04..d4b1a5a 100644
+--- a/aten/src/ATen/native/cuda/Unique.cu
++++ b/aten/src/ATen/native/cuda/Unique.cu
+@@ -14,6 +14,7 @@
+ #include <ATen/ops/_unique_native.h>
+ #include <ATen/ops/arange.h>
+ #include <ATen/ops/empty.h>
++#include <ATen/ops/nonzero.h>
+ #include <ATen/ops/unique_consecutive_native.h>
+ #include <ATen/ops/unique_dim_consecutive_native.h>
+ #include <ATen/ops/unique_dim_native.h>
+@@ -30,10 +31,143 @@
+ 
+ #include <ATen/native/cuda/UniqueCub.cuh>
+ 
++#include <cstring>
++
+ namespace at::native {
+ 
+ namespace {
+ 
++#if defined(USE_ROCM)
++bool is_gfx1010_device() {
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  return prop != nullptr && std::strncmp(prop->gcnArchName, "gfx1010", 7) == 0;
++}
++#endif
++
++__global__ void unique_counts_kernel(
++    int64_t n,
++    const int64_t* unique_indices,
++    int64_t num_inp,
++    int64_t* counts) {
++  int64_t i = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x;
++  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++  for (; i < n; i += stride) {
++    const int64_t next = i + 1 < n ? unique_indices[i + 1] : num_inp;
++    counts[i] = next - unique_indices[i];
++  }
++}
++
++__global__ void unique_dim_inverse_kernel(
++    int64_t n,
++    const int64_t* unique_positions,
++    int64_t num_unique,
++    const int64_t* indices,
++    int64_t* inverse_indices) {
++  int64_t i = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x;
++  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++  for (; i < n; i += stride) {
++    int64_t left = 0;
++    int64_t right = num_unique;
++    while (left < right) {
++      const int64_t mid = left + (right - left) / 2;
++      if (unique_positions[mid] <= i) {
++        left = mid + 1;
++      } else {
++        right = mid;
++      }
++    }
++    inverse_indices[indices[i]] = left - 1;
++  }
++}
++
++template <typename scalar_t>
++__global__ void row_unique_flags_kernel(
++    int64_t num_rows,
++    int64_t row_width,
++    const scalar_t* input_flat,
++    const int64_t* indices,
++    int* flags) {
++  int64_t row = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x;
++  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++  for (; row < num_rows; row += stride) {
++    bool unique = row == 0;
++    if (!unique) {
++      const int64_t curr = indices[row];
++      const int64_t prev = indices[row - 1];
++      unique = true;
++      for (int64_t col = 0; col < row_width; ++col) {
++        const scalar_t lhs = c10::load(&input_flat[col + curr * row_width]);
++        const scalar_t rhs = c10::load(&input_flat[col + prev * row_width]);
++        if (lhs != rhs) {
++          break;
++        }
++        if (col + 1 == row_width) {
++          unique = false;
++        }
++      }
++    }
++    flags[row] = unique;
++  }
++}
++
++template <typename scalar_t>
++std::tuple<Tensor, Tensor, Tensor, int64_t> compute_unique_dim_gfx1010(
++    const Tensor& input_flat,
++    const Tensor& indices,
++    const bool return_inverse,
++    const bool return_counts) {
++  const int64_t num_inp = indices.numel();
++  const int64_t row_width = input_flat.size(1);
++  const scalar_t* input_flat_ptr = input_flat.const_data_ptr<scalar_t>();
++  const int64_t* indices_ptr = indices.const_data_ptr<int64_t>();
++  auto long_options = indices.options();
++  auto int_options = indices.options().dtype(kInt);
++  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++  Tensor flags = at::empty({num_inp}, int_options);
++  constexpr int nthreads = 256;
++  const int64_t nblocks =
++      std::min<int64_t>(4096, (num_inp + nthreads - 1) / nthreads);
++  row_unique_flags_kernel<<<nblocks, nthreads, 0, stream>>>(
++      num_inp,
++      row_width,
++      input_flat_ptr,
++      indices_ptr,
++      flags.mutable_data_ptr<int>());
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++  Tensor unique_positions = at::nonzero(flags).view({-1});
++  const int64_t num_out = unique_positions.numel();
++  Tensor unique_indices = indices.index_select(0, unique_positions);
++
++  Tensor inverse_indices = at::empty({0}, long_options);
++  if (return_inverse) {
++    inverse_indices = at::empty({num_inp}, long_options);
++    unique_dim_inverse_kernel<<<nblocks, nthreads, 0, stream>>>(
++        num_inp,
++        unique_positions.const_data_ptr<int64_t>(),
++        num_out,
++        indices_ptr,
++        inverse_indices.mutable_data_ptr<int64_t>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++  }
++
++  Tensor counts = at::empty({0}, long_options);
++  if (return_counts) {
++    counts = at::empty({num_out}, long_options);
++    if (num_out > 0) {
++      unique_counts_kernel<<<nblocks, nthreads, 0, stream>>>(
++          num_out,
++          unique_positions.const_data_ptr<int64_t>(),
++          num_inp,
++          counts.mutable_data_ptr<int64_t>());
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++  }
++
++  return std::make_tuple(unique_indices, inverse_indices, counts, num_out);
++}
++
+ template <
+   typename policy_t, typename scalar_t,
+   typename equal_t, typename not_equal_t
+@@ -155,6 +289,16 @@ std::tuple<Tensor, Tensor, Tensor> unique_dim_cuda_template(
+     );
+   }
+ 
++#if defined(USE_ROCM)
++  if (is_gfx1010_device()) {
++    auto [unique_indices, inverse_indices, counts, num_out] =
++        compute_unique_dim_gfx1010<scalar_t>(
++            input_flat, indices, return_inverse, return_counts);
++    return std::tuple<Tensor, Tensor, Tensor>(
++        self.index_select(dim, unique_indices), inverse_indices, counts);
++  }
++#endif
++
+   auto [inverse_indices, counts, num_out] = compute_unique(
+     policy, indices_data, num_inp, indices,
+     return_inverse, return_counts, options,
+diff --git a/aten/src/ATen/native/cuda/UniqueCub.cu b/aten/src/ATen/native/cuda/UniqueCub.cu
+index 3fac010..05e6252 100644
+--- a/aten/src/ATen/native/cuda/UniqueCub.cu
++++ b/aten/src/ATen/native/cuda/UniqueCub.cu
+@@ -15,8 +15,11 @@
+ #else
+ #include <ATen/ops/arange.h>
+ #include <ATen/ops/empty.h>
++#include <ATen/ops/nonzero.h>
+ #endif
+ 
++#include <cstring>
++
+ namespace at::native::internal {
+ 
+ namespace {
+@@ -41,6 +44,50 @@ __global__ void scatter_kernel(
+   }
+ }
+ 
++template <typename InputIteratorT>
++__global__ void unique_flags_kernel(
++    int64_t n,
++    InputIteratorT input,
++    int* output) {
++  CUDA_KERNEL_LOOP(i, n) {
++    output[i] = i == 0 || input[i] != input[i - 1];
++  }
++}
++
++__global__ void unique_counts_kernel(
++    int64_t n,
++    const int64_t* unique_indices,
++    int64_t num_inp,
++    int64_t* counts) {
++  CUDA_KERNEL_LOOP(i, n) {
++    const int64_t next = i + 1 < n ? unique_indices[i + 1] : num_inp;
++    counts[i] = next - unique_indices[i];
++  }
++}
++
++__global__ void unique_inverse_kernel(
++    int64_t n,
++    const int64_t* unique_indices,
++    int64_t num_unique,
++    const int64_t* sorted_indices,
++    bool scatter_to_input_order,
++    int64_t* inverse_indices) {
++  CUDA_KERNEL_LOOP(i, n) {
++    int64_t left = 0;
++    int64_t right = num_unique;
++    while (left < right) {
++      const int64_t mid = left + (right - left) / 2;
++      if (unique_indices[mid] <= i) {
++        left = mid + 1;
++      } else {
++        right = mid;
++      }
++    }
++    const int64_t out_index = scatter_to_input_order ? sorted_indices[i] : i;
++    inverse_indices[out_index] = left - 1;
++  }
++}
++
+ template <typename scalar_t>
+ const scalar_t * wrap_input_iterator(const scalar_t *data) {
+   return data;
+@@ -59,6 +106,105 @@ auto wrap_input_iterator(const bool *data) {
+       reinterpret_cast<const uint8_t*>(data), op);
+ }
+ 
++#if defined(USE_ROCM)
++bool is_gfx1010_device() {
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  return prop != nullptr && std::strncmp(prop->gcnArchName, "gfx1010", 7) == 0;
++}
++
++template <typename scalar_t>
++std::tuple<Tensor, Tensor, Tensor> compute_unique_gfx1010(
++    const Tensor& sorted,
++    const Tensor& sorted_indices,
++    const bool return_inverse,
++    const bool return_counts,
++    const bool consecutive,
++    const IntArrayRef inverse_sizes) {
++  const int64_t num_inp = sorted.numel();
++  auto long_options = sorted.options().dtype(kLong);
++  auto int_options = sorted.options().dtype(kInt);
++  auto data = wrap_input_iterator(sorted.const_data_ptr<scalar_t>());
++  cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++
++  Tensor flags = at::empty({num_inp}, int_options);
++  const dim3 block =
++      dim3(std::min(static_cast<int64_t>(cuda::getApplyBlock().x), num_inp));
++  dim3 grid;
++  c10::DeviceIndex curDevice = -1;
++  c10::cuda::GetDevice(&curDevice);
++  cuda::getApplyGrid(num_inp, grid, curDevice);
++  unique_flags_kernel<<<grid, block, 0, stream>>>(
++      num_inp, data, flags.mutable_data_ptr<int>());
++  C10_CUDA_KERNEL_LAUNCH_CHECK();
++
++  Tensor unique_indices = at::nonzero(flags).view({-1});
++  const int64_t num_out = unique_indices.numel();
++  Tensor data_out = sorted.index_select(0, unique_indices);
++
++  Tensor inverse_indices;
++  if (!return_inverse) {
++    inverse_indices = at::empty({0}, long_options);
++  } else {
++    inverse_indices = at::empty(inverse_sizes, long_options);
++    TORCH_INTERNAL_ASSERT(
++        consecutive || sorted_indices.defined(),
++        "return_inverse is set to true, but sorted_indices is undefined. Send a bug report!");
++    unique_inverse_kernel<<<grid, block, 0, stream>>>(
++        num_inp,
++        unique_indices.const_data_ptr<int64_t>(),
++        num_out,
++        consecutive ? nullptr : sorted_indices.const_data_ptr<int64_t>(),
++        !consecutive,
++        inverse_indices.mutable_data_ptr<int64_t>());
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++  }
++
++  Tensor counts = at::empty({0}, long_options);
++  if (return_counts) {
++    counts = at::empty({num_out}, long_options);
++    if (num_out > 0) {
++      unique_counts_kernel<<<grid, block, 0, stream>>>(
++          num_out,
++          unique_indices.const_data_ptr<int64_t>(),
++          num_inp,
++          counts.mutable_data_ptr<int64_t>());
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++  }
++
++  return std::tuple<Tensor, Tensor, Tensor>(
++      data_out, inverse_indices, counts);
++}
++
++template <typename scalar_t>
++std::tuple<Tensor, Tensor, Tensor> unique_gfx1010(
++    const Tensor& self,
++    const bool consecutive,
++    const bool return_inverse,
++    const bool return_counts) {
++  const int64_t num_inp = self.numel();
++  Tensor sorted;
++  Tensor sorted_indices;
++  if (consecutive) {
++    sorted = self.reshape({num_inp});
++  } else {
++    auto sorted_tuple = self.reshape({num_inp}).sort();
++    sorted = std::get<0>(sorted_tuple);
++    if (return_inverse) {
++      sorted_indices = std::get<1>(sorted_tuple);
++    }
++  }
++
++  return compute_unique_gfx1010<scalar_t>(
++      sorted,
++      sorted_indices,
++      return_inverse,
++      return_counts,
++      consecutive,
++      self.sizes());
++}
++#endif
++
+ // A variation of compute_unique (defined in Unique.cu) that doesn't allow
+ // customizing equal and not_equal (CUB doesn't allow them).
+ template <typename scalar_t>
+@@ -318,6 +464,12 @@ std::tuple<Tensor, Tensor, Tensor> unique_cuda_template(
+   }
+ 
+   auto self_c = self.expect_contiguous();
++#if defined(USE_ROCM)
++  if (is_gfx1010_device()) {
++    return unique_gfx1010<scalar_t>(
++        *self_c, consecutive, return_inverse, return_counts);
++  }
++#endif
+   return UniqueCub<scalar_t>{}(*self_c, consecutive, return_inverse, return_counts);
+ }
+ 

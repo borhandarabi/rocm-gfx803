@@ -1,0 +1,160 @@
+The hipcub DeviceSelect::Flagged path that nonzero uses is broken on gfx1010.
+On gfx1010 only, nonzero first counts the nonzero elements with a small atomic
+kernel, then writes the indices through PyTorch's existing ordered block-scan
+flag_kernel, which keeps the index ordering. where(mask), masked_select, boolean
+indexing and tensor repr all go through nonzero and work without a CPU fallback.
+
+gfx1010-unique-hipcub-scan depends on this patch: it calls at::nonzero to
+compact its flags.
+
+Gated at runtime on gcnArchName starting with "gfx1010".
+
+NOT YET RE-VERIFIED ON REAL HARDWARE: applies to ROCm/pytorch release/2.14; not built or run on a gfx1010 card.
+
+diff --git a/aten/src/ATen/native/cuda/Nonzero.cu b/aten/src/ATen/native/cuda/Nonzero.cu
+index 9685913..d1bdf57 100644
+--- a/aten/src/ATen/native/cuda/Nonzero.cu
++++ b/aten/src/ATen/native/cuda/Nonzero.cu
+@@ -2,6 +2,7 @@
+ #include <ATen/Dispatch.h>
+ #include <ATen/EmptyTensor.h>
+ #include <ATen/core/Tensor.h>
++#include <ATen/cuda/Atomic.cuh>
+ #include <ATen/cuda/CUDAContext.h>
+ #include <ATen/cuda/EmptyTensor.h>
+ #include <ATen/cuda/detail/KernelUtils.h>
+@@ -16,6 +17,8 @@
+ #include <ATen/ops/nonzero_native.h>
+ #endif
+ 
++#include <cstring>
++
+ namespace at::native {
+ 
+ namespace {
+@@ -26,6 +29,28 @@ struct NonZeroOp {
+   }
+ };
+ 
++#if defined(USE_ROCM)
++bool is_gfx1010_device() {
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  return prop != nullptr && std::strncmp(prop->gcnArchName, "gfx1010", 7) == 0;
++}
++
++template <typename T>
++__global__ void count_nonzero_atomic_kernel(
++    const T* input,
++    int64_t n,
++    int64_t* count) {
++  int64_t index = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x;
++  int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
++  for (; index < n; index += stride) {
++    if (input[index] != T(0)) {
++      gpuAtomicAdd(count, static_cast<int64_t>(1));
++    }
++  }
++}
++
++#endif
++
+ // TODO: actually support int64_t index_t
+ template <typename index_t>
+ struct TensorDims {
+@@ -170,6 +195,96 @@ template <typename scalar_t>
+ void nonzero_cuda_out_impl(const Tensor& self, Tensor& out) {
+   Tensor self_ = self.contiguous();
+   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
++#if defined(USE_ROCM)
++  if (is_gfx1010_device()) {
++    auto& allocator = *c10::cuda::CUDACachingAllocator::get();
++    auto count = allocator.allocate(sizeof(int64_t));
++    AT_CUDA_CHECK(cudaMemsetAsync(count.get(), 0, sizeof(int64_t), stream));
++
++    if (self.numel() > 0) {
++      constexpr int nthreads = 256;
++      const int64_t max_blocks = 4096;
++      const int64_t nblocks =
++          std::min(max_blocks, (self.numel() + nthreads - 1) / nthreads);
++      count_nonzero_atomic_kernel<<<nblocks, nthreads, 0, stream>>>(
++          self_.const_data_ptr<scalar_t>(),
++          self.numel(),
++          static_cast<int64_t*>(count.get()));
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++    }
++
++    int64_t num_nonzeros_h = 0;
++    at::cuda::memcpy_and_sync(
++        &num_nonzeros_h,
++        count.get(),
++        sizeof(int64_t),
++        cudaMemcpyDeviceToHost,
++        stream);
++
++    bool need_to_copy = out.dim() == 2 && out.sizes()[0] == num_nonzeros_h &&
++        out.sizes()[1] == self.dim() && !out.t().is_contiguous();
++    at::Tensor out_temp = need_to_copy
++        ? Tensor(at::detail::empty_cuda({self.dim(), num_nonzeros_h}, out.options()))
++        : out.resize_({self.dim(), num_nonzeros_h});
++
++    if (self.dim() > 0 && num_nonzeros_h > 0) {
++      const scalar_t* in_data_ptr = self_.const_data_ptr<scalar_t>();
++      constexpr int BLOCK_THREADS = 512;
++      constexpr int ITEMS_PER_THREAD = 16;
++      auto grid_size = (self.numel() + BLOCK_THREADS * ITEMS_PER_THREAD - 1) /
++          (BLOCK_THREADS * ITEMS_PER_THREAD);
++      const int64_t num_sms =
++          at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
++      int64_t target_blocks = sizeof(scalar_t) == 1 ? 2 * num_sms : num_sms;
++      const int iters_per_cta = (grid_size + target_blocks - 1) / target_blocks;
++      grid_size = (self.numel() + iters_per_cta * BLOCK_THREADS *
++              ITEMS_PER_THREAD - 1) /
++          (iters_per_cta * BLOCK_THREADS * ITEMS_PER_THREAD);
++
++      auto agg = allocator.allocate(grid_size * sizeof(int));
++      at::cuda::cub::calc_block_sums<BLOCK_THREADS, ITEMS_PER_THREAD, true>
++          <<<grid_size, BLOCK_THREADS, 0, stream>>>(
++              in_data_ptr, static_cast<int*>(agg.get()), self.numel(), iters_per_cta);
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++      auto agg_cum = allocator.allocate(grid_size * sizeof(int64_t));
++      compute_agg<BLOCK_THREADS><<<1, BLOCK_THREADS, 0, stream>>>(
++          static_cast<int*>(agg.get()),
++          static_cast<int64_t*>(agg_cum.get()),
++          grid_size);
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++      flag_kernel<BLOCK_THREADS, ITEMS_PER_THREAD>
++          <<<grid_size, BLOCK_THREADS, 0, stream>>>(
++              in_data_ptr,
++              out_temp.mutable_data_ptr<int64_t>(),
++              static_cast<int64_t*>(agg_cum.get()),
++              self.numel(),
++              num_nonzeros_h,
++              iters_per_cta);
++      C10_CUDA_KERNEL_LAUNCH_CHECK();
++      if (self.dim() > 1) {
++        TensorDims<int64_t> dims;
++        for (int i = 0; i < self.dim(); i++) {
++          dims.sizes[i] = self.sizes()[i];
++        }
++        constexpr int nthreads = 256;
++        const int nblocks = (num_nonzeros_h + nthreads - 1) / nthreads;
++        write_indices<<<nblocks, nthreads, 0, stream>>>(
++            out_temp.mutable_data_ptr<int64_t>(),
++            dims,
++            self.dim(),
++            num_nonzeros_h);
++        C10_CUDA_KERNEL_LAUNCH_CHECK();
++      }
++    }
++    if (need_to_copy) {
++      out.copy_(out_temp.t());
++    } else {
++      Tensor out_ = out_temp.t();
++      out.set_(out_);
++    }
++    return;
++  }
++#endif
+   int64_t chunk_size, num_chunks;
+   if (self.numel() < std::numeric_limits<int>::max()) {
+     chunk_size = self.numel();

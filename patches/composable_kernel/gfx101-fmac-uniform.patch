@@ -1,0 +1,55 @@
+This is a follow-up to gfx1010-nonzero-hipcub-select.patch and its siblings in
+../pytorch/: those fix PyTorch kernels for gfx1010; this fixes the FMA-instruction
+selection in the composable_kernel submodule that PyTorch pulls in.
+
+Upstream classifies gfx10.1 (RDNA1) inconsistently:
+  - gfx1011 and gfx1012 hit an elif branch shared with gfx9/gfx10.3 and get
+    CK_USE_AMD_V_FMAC_F32 *plus* CK_USE_AMD_V_DOT2_F32_F16 / CK_USE_AMD_V_DOT4_I32_I8.
+  - gfx1010 (and gfx1013) fall through to a later branch shared with
+    gfx803/gfx900/gfx90c and get CK_USE_AMD_V_MAC_F32, no dot macros.
+
+Per AMD's own RDNA1->RDNA2 changelog, the V_DOT* instructions were introduced in
+RDNA2 (gfx10.3), not RDNA1. Defining them for gfx1011/gfx1012 looks like an
+upstream bug, not a deliberate choice -- any composable_kernel code gated on
+those macros will try to emit dot-product instructions on hardware that does not
+have them.
+
+This patch gives all of gfx10.1 (gfx1010/1011/1012/1013, via the existing
+__gfx101__ umbrella macro) one consistent branch: CK_USE_AMD_V_FMAC_F32, no dot
+macros. v_mac_f32 and v_fmac_f32 both assemble validly on gfx1010 per LLVM's
+AMDGPUAsmGFX10 reference, so this is not fixing a build break -- it is picking
+one instruction consistently across a single hardware generation instead of
+letting three chips in the same family disagree, and it removes the
+dot-instruction macros that RDNA1 does not support.
+
+gfx803 is unaffected: it still matches the gfx900/gfx90c MAC branch untouched.
+
+CK_BUFFER_RESOURCE_3RD_DWORD in this file and CK_TILE_BUFFER_RESOURCE_3RD_DWORD
+in include/ck_tile/core/config.hpp already include gfx101 upstream (0x31014000);
+no patch needed there.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE: applies to the composable_kernel commit
+PyTorch release/2.14 pins as a submodule; not built or run on a gfx1010 card.
+
+diff --git a/include/ck/ck.hpp b/include/ck/ck.hpp
+index f3db019..19d05ff 100644
+--- a/include/ck/ck.hpp
++++ b/include/ck/ck.hpp
+@@ -98,12 +98,14 @@
+ 
+ // FMA instruction
+ #ifndef __HIP_DEVICE_COMPILE__ // for host code, define nothing
+-#elif defined(__gfx906__) || defined(__gfx9__) || defined(__gfx103__) || defined(__gfx1011__) || \
+-    defined(__gfx1012__) // for GPU code
++#elif defined(__gfx906__) || defined(__gfx9__) || defined(__gfx103__) // for GPU code
+ #define CK_USE_AMD_V_FMAC_F32
+ #define CK_USE_AMD_V_DOT2_F32_F16
+ #define CK_USE_AMD_V_DOT4_I32_I8
+-#elif defined(__gfx803__) || defined(__gfx900__) || defined(__gfx90c__) || defined(__gfx101__)
++#elif defined(__gfx101__) // RDNA1 (gfx1010/1011/1012/1013): v_fmac_f32; no dot-product
++                           // instructions -- those were added in RDNA2 (gfx103x), not RDNA1
++#define CK_USE_AMD_V_FMAC_F32
++#elif defined(__gfx803__) || defined(__gfx900__) || defined(__gfx90c__)
+ #define CK_USE_AMD_V_MAC_F32
+ #elif defined(__gfx11__) || defined(__gfx120__)
+ #define CK_USE_AMD_V_FMAC_F32

@@ -1,0 +1,108 @@
+scatter_add on gfx1010 (Navi10, RDNA1) is already correct through the generic
+atomic-add kernel. The dim=0 case with a broadcast index and matching trailing
+dimensions (the PyG message-passing shape) is the common hot path, and
+index_add_ computes the same result for it. On gfx1010 only, that one shape is
+routed through index_add_; every other shape falls through to the stock kernel.
+This is a performance path, not a correctness fix.
+
+Gated at runtime on gcnArchName starting with "gfx1010", so it is inert on
+gfx803 and on every other arch, and on CUDA builds.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE: applies to ROCm/pytorch release/2.14; not built or run on a gfx1010 card.
+
+diff --git a/aten/src/ATen/native/cuda/ScatterGatherKernel.cu b/aten/src/ATen/native/cuda/ScatterGatherKernel.cu
+index 15ce5ab..3bf686b 100644
+--- a/aten/src/ATen/native/cuda/ScatterGatherKernel.cu
++++ b/aten/src/ATen/native/cuda/ScatterGatherKernel.cu
+@@ -4,6 +4,7 @@
+ #include <ATen/Dispatch.h>
+ #include <ATen/ceil_div.h>
+ #include <ATen/MemoryOverlap.h>
++#include <ATen/WrapDimUtils.h>
+ 
+ #include <ATen/native/ScatterGatherChecks.h>
+ #include <ATen/native/ReduceOpsUtils.h>
+@@ -15,6 +16,9 @@
+ #include <ATen/cuda/Atomic.cuh>
+ #include <ATen/cuda/CUDAContext.h>
+ 
++#include <cstring>
++#include <optional>
++
+ namespace at::native {
+ 
+ // Implement as functors since lambdas don't get optimized.
+@@ -86,6 +90,61 @@ public:
+ };
+ static TensorAssign tensor_assign;
+ 
++#if defined(USE_ROCM)
++bool is_gfx1010_scatter_add_device() {
++  const auto* prop = at::cuda::getCurrentDeviceProperties();
++  return prop != nullptr && std::strncmp(prop->gcnArchName, "gfx1010", 7) == 0;
++}
++
++std::optional<Tensor> scatter_add_dim0_index_add_index(
++    const Tensor& self,
++    int64_t dim,
++    const Tensor& index,
++    const Tensor& src) {
++  dim = maybe_wrap_dim(dim, self.dim());
++  if (dim != 0 || self.dim() != src.dim()) {
++    return std::nullopt;
++  }
++  for (const auto d : c10::irange<int64_t>(1, self.dim())) {
++    if (self.size(d) != src.size(d)) {
++      return std::nullopt;
++    }
++  }
++  if (index.dim() == 1) {
++    return index;
++  }
++  if (index.dim() != src.dim() || index.size(0) != src.size(0)) {
++    return std::nullopt;
++  }
++  for (const auto d : c10::irange<int64_t>(1, index.dim())) {
++    if (index.size(d) != src.size(d) || index.stride(d) != 0) {
++      return std::nullopt;
++    }
++  }
++  Tensor index_1d = index;
++  for (auto d = index.dim() - 1; d > 0; --d) {
++    index_1d = index_1d.select(d, 0);
++  }
++  return index_1d;
++}
++
++bool try_gfx1010_scatter_add_via_index_add(
++    const Tensor& self,
++    int64_t dim,
++    const Tensor& index,
++    const Tensor& src) {
++  if (!is_gfx1010_scatter_add_device()) {
++    return false;
++  }
++  auto index_1d = scatter_add_dim0_index_add_index(self, dim, index, src);
++  if (!index_1d.has_value()) {
++    return false;
++  }
++  self.index_add_(0, *index_1d, src);
++  return true;
++}
++#endif
++
+ // The kernels are implemented on an opaque,
+ // self-aligned type of the correct size,
+ // to avoid redundant kernels for different types
+@@ -577,6 +636,11 @@ void scatter_fill_cuda_kernel(const Tensor& self, int64_t dim, const Tensor& ind
+ }
+ 
+ void scatter_add_cuda_kernel(const Tensor& self, int64_t dim, const Tensor& index, const Tensor& src) {
++#if defined(USE_ROCM)
++  if (try_gfx1010_scatter_add_via_index_add(self, dim, index, src)) {
++    return;
++  }
++#endif
+   cuda_scatter_gather_base_kernel</*is_scatter_like=*/true, /*cast_to_opaque=*/false>()(
+     self, dim, index, src,
+     "scatter_add_cuda_", reduce_add);

@@ -54,6 +54,30 @@ RUN --mount=type=bind,source=scripts/git-pin.sh,target=/git-pin \
 RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
     bash /patches/pytorch/apply-gfx803-c10-warp-size-wave64.sh /pytorch
 
+# gfx1010 (Navi10/RDNA1) fixes, inert on gfx803: hipcub's DeviceSelect::Flagged
+# is broken on gfx1010, so nonzero (and unique, which is built on nonzero) get a
+# gfx1010-only fallback path; MIOpen batch-norm/RNN are skipped on gfx1010 in
+# favor of the native kernels; scatter_add's dim=0 broadcast-index case is
+# routed through index_add_ on gfx1010. Each is gated at runtime on the GPU
+# arch string, so this is a no-op on every other target. nonzero must be
+# applied before unique, which calls it.
+RUN --mount=type=bind,source=patches/pytorch,target=/patches/pytorch \
+    bash /patches/pytorch/gfx1010-nonzero-hipcub-select.sh /pytorch \
+    && bash /patches/pytorch/gfx1010-unique-hipcub-scan.sh /pytorch \
+    && bash /patches/pytorch/gfx1010-miopen-bn-rnn-skip.sh /pytorch \
+    && bash /patches/pytorch/gfx1010-scatter-add-dim0-index-add.sh /pytorch
+
+# composable_kernel (pulled in as a pytorch submodule above) classifies RDNA1
+# inconsistently: gfx1011/gfx1012 get v_fmac_f32 plus dot-product macros that
+# RDNA1 hardware doesn't have (those shipped in RDNA2), while gfx1010 falls
+# through to the gfx803/900/90c v_mac_f32 branch. This gives all of gfx10.1
+# one consistent v_fmac_f32 branch with no dot macros. gfx803 is untouched --
+# it still matches the gfx900/gfx90c branch. Must run after the submodule
+# checkout above; independent of the pytorch-side patches, so order relative
+# to them doesn't matter.
+RUN --mount=type=bind,source=patches/composable_kernel,target=/patches/composable_kernel \
+    bash /patches/composable_kernel/gfx101-fmac-uniform.sh /pytorch/third_party/composable_kernel
+
 WORKDIR /pytorch
 RUN pip install --no-cache-dir -r requirements.txt
 RUN python3 tools/amd_build/build_amd.py

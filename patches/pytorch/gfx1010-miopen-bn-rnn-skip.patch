@@ -1,0 +1,65 @@
+MIOpen's batch-norm and RNN (LSTM/GRU/RNN) paths are broken on gfx1010. On
+gfx1010 only, _select_batch_norm_backend() refuses MIOpen and use_miopen() in
+RNN.cpp returns false, so PyTorch's native GPU kernels run instead while
+torch.backends.cudnn.enabled stays on.
+
+Gated at runtime on isGPUArch({"gfx1010"}), so other arches, including gfx803,
+keep the MIOpen path.
+
+NOT YET RE-VERIFIED ON REAL HARDWARE: applies to ROCm/pytorch release/2.14; not built or run on a gfx1010 card.
+
+diff --git a/aten/src/ATen/native/Normalization.cpp b/aten/src/ATen/native/Normalization.cpp
+index 71c7e6d..7e5564d 100644
+--- a/aten/src/ATen/native/Normalization.cpp
++++ b/aten/src/ATen/native/Normalization.cpp
+@@ -98,6 +98,12 @@ namespace {
+     }
+     return t;
+   }
++
++#if defined(USE_ROCM)
++  bool is_gfx1010_device() {
++    return detail::getCUDAHooks().isGPUArch({"gfx1010"});
++  }
++#endif
+ }
+ 
+ template<typename T>
+@@ -533,6 +539,9 @@ BatchNormBackend _select_batch_norm_backend(
+       detail::getCUDAHooks().compiledWithMIOpen()
+       && cudnn_enabled
+       && input.is_cuda()
++#if defined(USE_ROCM)
++      && !is_gfx1010_device()
++#endif
+       && input.dim() <= MIOPEN_DIM_MAX
+       && input.dim() >= 3
+       && input.scalar_type() != at::kDouble
+diff --git a/aten/src/ATen/native/RNN.cpp b/aten/src/ATen/native/RNN.cpp
+index f2ebddc..d2be415 100644
+--- a/aten/src/ATen/native/RNN.cpp
++++ b/aten/src/ATen/native/RNN.cpp
+@@ -67,12 +67,23 @@ namespace at::native {
+ 
+ namespace {
+ 
++#if defined(USE_ROCM)
++bool is_gfx1010_device() {
++  return detail::getCUDAHooks().isGPUArch({"gfx1010"});
++}
++#endif
++
+ // Check if pytorch is compiled with MIOpen.
+ bool use_miopen(const at::Tensor& input, const double dropout_state) {
+     bool is_miopen_acceptable = ((input.scalar_type() == at::kFloat)|| (input.scalar_type() == at::kHalf)) &&
+                                 (detail::getCUDAHooks().compiledWithMIOpen()) &&
+                                 (input.is_cuda()) &&
+                                 (at::globalContext().userEnabledCuDNN());
++#if defined(USE_ROCM)
++    if (is_miopen_acceptable && is_gfx1010_device()) {
++      return false;
++    }
++#endif
+     // MIOpen functions returns miopenStatusBadParm on empty
+     // tensors. Maybe some functions actually support empty tensors, but
+     // native kernels shouldn't be much slower because the output is also
