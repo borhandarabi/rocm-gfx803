@@ -45,14 +45,12 @@ SIGN_KEY=""
 SIGN_CERT=""
 ALLOW_MISMATCH=0
 DO_INITRAMFS=1
-DEB_SRC_LIST=""
 
 log() { printf '==> %s\n' "$*"; }
 warn() { printf 'WARNING: %s\n' "$*" >&2; }
 die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 
 cleanup() {
-    [ -n "$DEB_SRC_LIST" ] && rm -f "$DEB_SRC_LIST"
     return 0
 }
 trap cleanup EXIT
@@ -117,8 +115,9 @@ fetch_patch() {
         || die "$dest/$PATCH_NAME.patch is not the expected patch file"
 }
 
-# Ubuntu ships its kernel source as the `linux` source package, at the same
-# version as linux-modules-<abi>-<flavour>. Only the exact version is accepted.
+# Return the source version recorded by the installed kernel package.
+# The source package name is discovered separately because Ubuntu HWE kernels
+# may come from source packages such as linux-hwe-7.0 rather than `linux`.
 running_source_version() {
     dpkg-query -W -f='${Version}' "linux-modules-${KVER}" 2>/dev/null \
         || dpkg-query -W -f='${Version}' "linux-image-${KVER}" 2>/dev/null \
@@ -126,14 +125,53 @@ running_source_version() {
         || true
 }
 
-enable_deb_src() {
-    if apt-cache showsrc linux 2>/dev/null | grep -q '^Version:'; then
+fetch_source() {
+    if [ -n "$SRC_DIR" ]; then
+        [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
+            die "$SRC_DIR is not a kernel source root"
         return 0
     fi
 
-    local list
-    local src_list="$WORK/gfx803-deb-src.sources"
-    local lists_dir="$WORK/apt-lists"
+    local want source_pkg source_ver src_list lists_dir list out have
+
+    want="$(running_source_version)"
+    [ -n "$want" ] ||
+        die "cannot tell which source version kernel $KVER was built from; pass --source-dir"
+
+    source_pkg="$(
+        dpkg-query -W -f='${source:Package}\n' "linux-modules-${KVER}" 2>/dev/null |
+        head -1
+    )"
+
+    if [ -z "$source_pkg" ]; then
+        source_pkg="$(
+            dpkg-query -W -f='${source:Package}\n' "linux-image-${KVER}" 2>/dev/null |
+            head -1
+        )"
+    fi
+
+    if [ -z "$source_pkg" ]; then
+        source_pkg="$(
+            dpkg-query -W -f='${source:Package}\n' "linux-image-unsigned-${KVER}" 2>/dev/null |
+            head -1
+        )"
+    fi
+
+    [ -n "$source_pkg" ] ||
+        die "cannot determine the source package for kernel $KVER; pass --source-dir"
+
+    source_ver="$(
+        apt-cache showsrc "$source_pkg" 2>/dev/null |
+        awk -v pkg="$source_pkg" '
+            $1 == "Package:" && $2 == pkg { found=1; next }
+            found && $1 == "Version:" { print $2; exit }
+        '
+    )"
+
+    [ -n "$source_ver" ] || source_ver="$want"
+
+    src_list="$WORK/gfx803-deb-src.sources"
+    lists_dir="$WORK/apt-lists"
 
     mkdir -p "$lists_dir/partial"
 
@@ -155,72 +193,72 @@ enable_deb_src() {
                 ;;
         esac
 
-        log "Updating only the kernel deb-src indexes"
+        break
+    done
 
-        apt-get update \
+    [ -s "$src_list" ] ||
+        die "no Ubuntu apt source configuration available for deb-src"
+
+    log "Updating only the kernel deb-src indexes"
+
+    apt-get update \
+        -o Dir::Etc::sourcelist="$src_list" \
+        -o Dir::Etc::sourceparts="-" \
+        -o Dir::State::lists="$lists_dir" \
+        -o APT::Get::List-Cleanup="0" \
+        </dev/null ||
+        die "failed to update the kernel deb-src indexes"
+
+    source_ver="$(
+        apt-cache \
             -o Dir::Etc::sourcelist="$src_list" \
             -o Dir::Etc::sourceparts="-" \
             -o Dir::State::lists="$lists_dir" \
-            -o APT::Get::List-Cleanup="0" \
-            </dev/null
+            showsrc "$source_pkg" 2>/dev/null |
+        awk -v pkg="$source_pkg" '
+            $1 == "Package:" && $2 == pkg { found=1; next }
+            found && $1 == "Version:" { print $2; exit }
+        '
+    )"
 
-        DEB_SRC_LIST="$src_list"
-        APT_SOURCE_LIST="$src_list"
-        APT_LISTS_DIR="$lists_dir"
-
-        return 0
-    done
-
-    die "no deb-src apt source available; unpack the matching kernel source yourself and pass --source-dir"
-}
-
-fetch_source() {
-    if [ -n "$SRC_DIR" ]; then
-        [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
-            die "$SRC_DIR is not a kernel source root"
-        return 0
-    fi
-
-    local want have out
-
-    want="$(running_source_version)"
-    [ -n "$want" ] ||
-        die "cannot tell which source version kernel $KVER was built from; pass --source-dir"
-
-    enable_deb_src
-
-    [ -n "${APT_SOURCE_LIST:-}" ] ||
-        die "internal error: APT_SOURCE_LIST was not set by enable_deb_src"
-
-    [ -n "${APT_LISTS_DIR:-}" ] ||
-        die "internal error: APT_LISTS_DIR was not set by enable_deb_src"
+    [ -n "$source_ver" ] ||
+        die "source package $source_pkg is not available from the configured deb-src archives"
 
     mkdir -p "$WORK/src"
     cd "$WORK/src"
 
-    log "Fetching kernel source package linux=$want (about 250 MB download)"
+    log "Kernel source package: $source_pkg"
+    log "Kernel source version: $source_ver"
+    log "Fetching kernel source package ${source_pkg}=${source_ver} (about 250 MB download)"
 
     if ! apt-get \
-        -o Dir::Etc::sourcelist="$APT_SOURCE_LIST" \
+        -o Dir::Etc::sourcelist="$src_list" \
         -o Dir::Etc::sourceparts="-" \
-        -o Dir::State::lists="$APT_LISTS_DIR" \
-        source "linux=$want" </dev/null
+        -o Dir::State::lists="$lists_dir" \
+        source "${source_pkg}=${source_ver}" </dev/null
     then
         if [ "$ALLOW_MISMATCH" = 1 ]; then
-            warn "linux=$want is no longer in the archive; using the newest source"
+            warn "${source_pkg}=${source_ver} is no longer in the archive; using the newest source"
 
             apt-get \
-                -o Dir::Etc::sourcelist="$APT_SOURCE_LIST" \
+                -o Dir::Etc::sourcelist="$src_list" \
                 -o Dir::Etc::sourceparts="-" \
-                -o Dir::State::lists="$APT_LISTS_DIR" \
-                source linux </dev/null ||
-                die "failed to fetch the newest linux source package"
+                -o Dir::State::lists="$lists_dir" \
+                source "$source_pkg" </dev/null ||
+                die "failed to fetch the newest source package $source_pkg"
         else
-            die "linux=$want is not available from the archive. Pass --source-dir with the exact source, or --allow-source-mismatch to accept the newest one"
+            die "${source_pkg}=${source_ver} is not available from the archive. Pass --source-dir with the exact source, or --allow-source-mismatch to accept the newest one"
         fi
     fi
 
-    out="$(find "$WORK/src" -maxdepth 1 -mindepth 1 -type d -name 'linux*' | head -1)"
+    out="$(
+        find "$WORK/src" \
+            -maxdepth 1 \
+            -mindepth 1 \
+            -type d \
+            -name 'linux*' |
+        head -1
+    )"
 
     [ -n "$out" ] ||
         die "apt-get source produced no source directory"
@@ -239,6 +277,7 @@ fetch_source() {
         die "unpacked source is $have but the running kernel is $want"
     fi
 }
+
 
 apply_patch() {
     log "Applying $PATCH_NAME to $SRC_DIR"
