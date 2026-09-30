@@ -258,6 +258,8 @@ fetch_source() {
     stage_start "fetch_source"
     if [ -n "$SRC_DIR" ]; then
         validate_source_dir
+        log "Kernel source ready: $SRC_DIR"
+        stage_done
         return 0
     fi
 
@@ -437,11 +439,11 @@ apply_patch() {
 #
 # Two details are essential:
 #
-# 1. /boot/config-$KVER must be used unchanged. In particular,
-#    CONFIG_DEBUG_INFO_BTF_MODULES and the other module-related options affect
-#    the kernel's struct module layout. Using a generic/source-tree .config
-#    produced a cleanup_module relocation at 0x490, while the running kernel
-#    expects 0x4a8.
+# 1. /boot/config-$KVER must be used unchanged. The effective kernel
+#    configuration must match the running kernel when building an external
+#    module whose relocations depend on the kernel's struct module layout.
+#    The cleanup_module relocation is verified below against the actual
+#    struct module.exit offset extracted from the running kernel's BTF.
 #
 # 2. Ubuntu's packaged kernel has a distro-specific KERNELRELEASE such as
 #    7.0.0-34-generic even though the source Makefile is based on upstream
@@ -572,7 +574,8 @@ verify_module() {
     local vermagic
     local generated_release
     local relocation
-    local expected_relocation="00000000000004a8"
+    local expected_exit_offset
+    local expected_relocation
 
     log "VERIFY 1/8: amdgpu.ko exists"
     [ -f "$ko" ] ||
@@ -629,11 +632,25 @@ verify_module() {
 
     log "VERIFY 7/8: cleanup_module relocation"
 
+    expected_exit_offset="$(
+        pahole -C module /sys/kernel/btf/vmlinux |
+            sed -n \
+                's/.*void[[:space:]]\+(\*exit)(void);[[:space:]]*\/\*[[:space:]]*\([0-9]\+\).*/\1/p' |
+            head -1
+    )"
+
+    [ -n "$expected_exit_offset" ] ||
+        die "unable to determine struct module.exit offset from running kernel BTF"
+
+    expected_relocation="$(
+        printf '%x' "$expected_exit_offset"
+    )"
+
     relocation="$(
-        awk '
-            /\.rela\.gnu\.linkonce\.this_module/ {
-                in_section=1
-                next
+        awk ' 
+            /\.rela\.gnu\.linkonce\.this_module/ { 
+                in_section=1 
+                next 
             }
 
             in_section && /cleanup_module/ {
@@ -649,11 +666,18 @@ verify_module() {
         ' "$WORK/amdgpu-relocations.txt"
     )"
 
+    [ -n "$relocation" ] ||
+        die "unable to determine cleanup_module relocation"
+
+    relocation="$(
+        printf '%x' "$((16#$relocation))"
+    )"
+
     [ "$relocation" = "$expected_relocation" ] ||
         die \
-            "unexpected cleanup_module relocation '$relocation'; expected $expected_relocation"
+            "unexpected cleanup_module relocation '0x$relocation'; expected '0x$expected_relocation' from running kernel BTF"
 
-    log "PASS: cleanup_module relocation=0x4a8"
+    log "PASS: cleanup_module relocation=0x$relocation matches running kernel struct module.exit=0x$expected_relocation"
 
     log "VERIFY 8/8: module metadata"
 
@@ -665,7 +689,7 @@ verify_module() {
     log "Verified patched KFD source for Polaris10"
     log "Verified UTS_RELEASE: $generated_release"
     log "Verified vermagic: $vermagic"
-    log "Verified struct module cleanup_module relocation: 0x4a8"
+    log "Verified struct module cleanup_module relocation: 0x$relocation"
     log "Built: $ko"
 
     stage_done
