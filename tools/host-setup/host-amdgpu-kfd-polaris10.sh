@@ -86,7 +86,7 @@ require_host() {
 
 install_deps() {
     log "Installing build dependencies"
-    local pkgs="build-essential bc bison flex libelf-dev libssl-dev libncurses-dev dwarves rsync kmod cpio zstd xz-utils patch curl ca-certificates dpkg-dev initramfs-tools"
+    local pkgs="build-essential bc bison flex libelf-dev libdw-dev libssl-dev libncurses-dev dwarves rsync kmod cpio zstd xz-utils patch curl ca-certificates dpkg-dev initramfs-tools"
     if [ "$PATCH_ONLY" = 0 ]; then
         pkgs="$pkgs linux-headers-${KVER}"
     fi
@@ -333,11 +333,25 @@ build_module() {
 
 verify_module() {
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
+    local kfd_src="$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c"
+
     [ -f "$ko" ] || die "amdgpu.ko was not produced"
+
     modinfo -F vermagic "$ko" | grep -q "^${KVER} " \
         || die "vermagic '$(modinfo -F vermagic "$ko")' does not start with '$KVER'"
-    strings "$ko" | grep -q "PCI rejects atomics" \
-        || die "amdgpu.ko has no amdkfd atomics gate; it was built from the wrong tree"
+
+    [ -f "$kfd_src" ] || die "KFD source is missing: $kfd_src"
+
+    grep -q 'asic_type != CHIP_POLARIS10' "$kfd_src" \
+        || die "KFD source does not contain the Polaris10 PCI-atomics exemption"
+
+    grep -q 'asic_type != CHIP_HAWAII &&' "$kfd_src" \
+        || die "KFD source does not contain the expected atomics gate"
+
+    grep -q 'kfd->device_info.needs_pci_atomics = true' "$kfd_src" \
+        || die "KFD source has no PCI-atomics gate; wrong kernel tree"
+
+    log "Verified patched KFD source for Polaris10"
     log "Built $ko (vermagic: $(modinfo -F vermagic "$ko"))"
 }
 
