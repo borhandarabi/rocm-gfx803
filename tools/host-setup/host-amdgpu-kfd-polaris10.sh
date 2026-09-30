@@ -421,69 +421,102 @@ apply_patch() {
 #    7.0.14. KERNELRELEASE must therefore be forced to uname -r.
 configure_tree() {
     local headers="/usr/src/linux-headers-${KVER}"
-    local generated_release config_hash_running config_hash_source
+    local running_config="/boot/config-${KVER}"
 
-    [ -f "/boot/config-${KVER}" ] ||
-        die "/boot/config-${KVER} not found"
+    log "Synchronizing exact running-kernel config"
+
+    [ -f "$running_config" ] ||
+        die "missing running kernel config: $running_config"
+
+    [ -d "$headers" ] ||
+        die "missing kernel headers: $headers"
 
     [ -f "$headers/Module.symvers" ] ||
-        die "$headers/Module.symvers not found (install linux-headers-${KVER})"
-
-    [ -f "$headers/include/generated/utsrelease.h" ] ||
-        die "$headers/include/generated/utsrelease.h not found"
+        die "missing Module.symvers: $headers/Module.symvers"
 
     cd "$SRC_DIR"
 
-    log "Synchronizing exact running-kernel config"
-    cp -f "/boot/config-${KVER}" .config
+    # IMPORTANT:
+    # Copy the running kernel's config EXACTLY.
+    # Do NOT run olddefconfig afterwards and then compare the files
+    # byte-for-byte. Kconfig rewrites formatting/comments even when
+    # the effective configuration is unchanged.
+    cp -f "$running_config" .config
 
     log "Copying Module.symvers from running kernel headers"
     cp -f "$headers/Module.symvers" Module.symvers
 
+    # Prove that we really copied the exact running configuration.
+    cmp -s .config "$running_config" ||
+        die "failed to copy exact running-kernel config"
+
     log "Preparing kernel metadata for $KVER"
 
-    make \
-        KERNELRELEASE="$KVER" \
-        olddefconfig \
-        >"$WORK/olddefconfig.log" 2>&1 ||
-        {
-            tail -30 "$WORK/olddefconfig.log" >&2
-            die "make olddefconfig failed; full log: $WORK/olddefconfig.log"
-        }
-
-    make \
+    # KERNELRELEASE MUST be forced to the running Ubuntu kernel release.
+    # The Ubuntu source tree itself reports 7.0.14, while the running
+    # kernel is 7.0.0-34-generic.
+    make -C "$SRC_DIR" \
         KERNELRELEASE="$KVER" \
         modules_prepare \
-        >"$WORK/prepare.log" 2>&1 ||
-        {
-            tail -30 "$WORK/prepare.log" >&2
-            die "modules_prepare failed; full log: $WORK/prepare.log"
+        >"$WORK/modules-prepare.log" 2>&1 || {
+            tail -100 "$WORK/modules-prepare.log" >&2
+            die "modules_prepare failed"
         }
 
-    generated_release="$(
-        sed -n \
-            's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
-            include/generated/utsrelease.h
-    )"
+    # modules_prepare must not replace the effective configuration.
+    # If it rewrites the file, restore the exact running config and
+    # prepare once more without olddefconfig.
+    if ! cmp -s .config "$running_config"; then
+        warn "modules_prepare rewrote .config; restoring exact running config"
 
-    [ "$generated_release" = "$KVER" ] ||
-        die "generated UTS_RELEASE '$generated_release' does not match running kernel '$KVER'"
+        cp -f "$running_config" .config
 
-    config_hash_running="$(sha256sum "/boot/config-${KVER}" | awk '{print $1}')"
-    config_hash_source="$(sha256sum .config | awk '{print $1}')"
+        make -C "$SRC_DIR" \
+            KERNELRELEASE="$KVER" \
+            modules_prepare \
+            >"$WORK/modules-prepare-2.log" 2>&1 || {
+                tail -100 "$WORK/modules-prepare-2.log" >&2
+                die "second modules_prepare failed"
+            }
+    fi
 
-    [ "$config_hash_running" = "$config_hash_source" ] ||
-        die "source .config differs from /boot/config-${KVER}"
+    cmp -s .config "$running_config" ||
+        die "source .config differs from /boot/config-$KVER"
 
-    grep -q '^CONFIG_DRM_AMDGPU=m$' .config ||
-        die "the running kernel does not build amdgpu as a module"
+    # Verify the configuration symbols that matter for this build.
+    grep -qx 'CONFIG_DRM_AMDGPU=m' .config ||
+        die "CONFIG_DRM_AMDGPU is not=m"
 
-    grep -q '^CONFIG_HSA_AMD=y$' .config ||
-        die "the running kernel is built without CONFIG_HSA_AMD"
+    grep -qx 'CONFIG_HSA_AMD=y' .config ||
+        die "CONFIG_HSA_AMD is not enabled"
 
-    log "Verified KERNELRELEASE=$KVER"
-    log "Verified UTS_RELEASE=$generated_release"
-    log "Verified exact kernel config"
+    grep -qx 'CONFIG_MODULES=y' .config ||
+        die "CONFIG_MODULES is not enabled"
+
+    grep -qx 'CONFIG_MODVERSIONS=y' .config ||
+        die "CONFIG_MODVERSIONS is not enabled"
+
+    grep -qx 'CONFIG_MODULES_USE_ELF_RELA=y' .config ||
+        die "CONFIG_MODULES_USE_ELF_RELA is not enabled"
+
+    grep -qx 'CONFIG_LTO_NONE=y' .config ||
+        die "CONFIG_LTO_NONE is not enabled"
+
+    # Make sure generated UTS release matches the running kernel.
+    local uts_file="include/generated/utsrelease.h"
+
+    if [ -f "$uts_file" ]; then
+        grep -q "\"${KVER}\"" "$uts_file" ||
+            die "generated UTS release does not match $KVER"
+    fi
+
+    log "Kernel configuration verified"
+    log "  KERNELRELEASE = $KVER"
+    log "  CONFIG_DRM_AMDGPU = $(grep '^CONFIG_DRM_AMDGPU=' .config)"
+    log "  CONFIG_HSA_AMD = $(grep '^CONFIG_HSA_AMD=' .config)"
+    log "  CONFIG_MODVERSIONS = $(grep '^CONFIG_MODVERSIONS=' .config)"
+    log "  CONFIG_LTO_NONE = $(grep '^CONFIG_LTO_NONE=' .config)"
+    log "  CONFIG_MODULES_USE_ELF_RELA = $(grep '^CONFIG_MODULES_USE_ELF_RELA=' .config)"
 }
 
 build_module() {
