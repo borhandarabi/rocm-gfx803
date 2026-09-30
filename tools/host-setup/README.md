@@ -1,4 +1,4 @@
-# Host setup: PCIe ASPM disable, native ROCm+vLLM install
+# Host setup: PCIe ASPM disable, native ROCm+vLLM install, host kernel and runtime
 
 ## PCIe ASPM disable
 
@@ -79,3 +79,30 @@ symlinked into `/root` which a non-root user can never reach, and a
 system `libopenblas` dependency the host's package manager doesn't
 provide under the same name by default) -- read it before reusing this on
 a different box, since exact paths/package names may differ.
+
+## Host kernel: Polaris10 on a slot without PCIe atomics
+
+A Polaris10 card (RX 470/480/570/580) behind a link that cannot forward PCIe
+AtomicOps gets no KFD node, and `dmesg` shows
+`kfd kfd: skipped device 1002:67df, PCI rejects atomics 730<0`. amdkfd runs in
+the host kernel, so no change to the Docker image can affect it.
+`patches/kernel/amdkfd-polaris10-no-pci-atomics.patch` holds the fix and its
+reasoning; `host-amdgpu-kfd-polaris10.sh` fetches the kernel source that
+matches the running kernel, applies the patch, builds `amdgpu.ko` and installs
+it under `/lib/modules/<release>/updates/`, next to the untouched stock module.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/borhandarabi/rocm-gfx803/main/tools/host-setup/host-amdgpu-kfd-polaris10.sh | sudo bash
+# build and verify only:
+curl -fsSL .../host-amdgpu-kfd-polaris10.sh | sudo bash -s -- --build-only
+```
+
+Ubuntu/Debian only. It needs a reboot to take effect (the running amdgpu drives
+the display), and it covers one kernel release: run it again after each kernel
+update. `--uninstall` puts the stock module back. With Secure Boot on, the
+module has to be signed with an enrolled key (`--sign-key`, `--sign-cert`; the
+key `shim-signed` generates for DKMS is picked up automatically).
+
+The patch removes the atomics requirement without proof that queues and
+signals behave correctly without them, so run `tools/correctness-suite` and
+`verify.py` on the card before trusting results.

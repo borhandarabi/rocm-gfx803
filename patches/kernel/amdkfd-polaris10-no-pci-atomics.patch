@@ -1,0 +1,54 @@
+HOST KERNEL PATCH -- NOT applied by the Docker build. The container shares the
+host's kernel, so amdkfd's device gate can only be changed in the host's
+amdgpu module; build it with amdkfd-polaris10-no-pci-atomics.sh (same
+directory). NOT YET RE-VERIFIED ON REAL HARDWARE.
+
+WHY: a Polaris10 card (PCI ID 1002:67df: RX 470/480/570/580) behind a PCIe link
+that cannot forward AtomicOps (typically a chipset-attached slot) never gets a
+KFD node. dmesg shows:
+
+    amdgpu 0000:05:00.0: PCIE atomic ops is not supported
+    kfd kfd: skipped device 1002:67df, PCI rejects atomics 730<0
+
+The two numbers are mec_fw_version (730, the installed MEC firmware) and
+no_atomic_fw_version (0). kgd2kfd_device_init() lets a device without PCIe
+atomics through only when needs_pci_atomics is false, or when a non-zero
+no_atomic_fw_version is at or below mec_fw_version. kfd_device_info_init()
+sets no_atomic_fw_version only for SOC15 parts (Navi1x/2x/3x, GFX11, GFX12);
+the GFX7/GFX8 branch never sets it, so for Polaris10 the gate always rejects,
+whatever the firmware version. Without a KFD node the card does not appear in
+/sys/class/kfd, so ROCR (patched and built by this repo's Docker image) never
+sees it and rocminfo lists no gfx803 agent. A card on CPU-attached lanes
+(AtomicOps available) is unaffected.
+
+WHAT: exempt CHIP_POLARIS10 from needs_pci_atomics, the same way CHIP_HAWAII is
+exempted on the line above. One condition in kfd_device_info_init(). It does
+not touch adev->have_atomics_support or the PCI capability, so KFD still
+reports the link as having no atomics.
+
+RISK: nothing in the kernel source establishes that Polaris10 queues, HSA
+signals and SDMA behave correctly without PCIe atomics. Hawaii is exempt
+because it was designed that way; Polaris10 is not. The failure mode is more
+likely a silent hang or a wrong result than a clean error. Run
+tools/correctness-suite and verify.py on the card before trusting it. If it
+misbehaves, the fix is on the hardware side: move the card to a CPU-attached
+slot.
+
+Applies to: drivers/gpu/drm/amd/amdkfd/kfd_device.c, kfd_device_info_init().
+The code is identical in mainline v7.0 and master.
+
+---
+--- a/drivers/gpu/drm/amd/amdkfd/kfd_device.c
++++ b/drivers/gpu/drm/amd/amdkfd/kfd_device.c
+@@ -245,7 +245,10 @@
+ 		    asic_type != CHIP_TONGA)
+ 			kfd->device_info.supports_cwsr = true;
+ 
+-		if (asic_type != CHIP_HAWAII && !vf)
++		/* Same exemption as Hawaii, so the node registers on a link without PCIe AtomicOps. */
++		if (asic_type != CHIP_HAWAII &&
++		    asic_type != CHIP_POLARIS10 &&
++		    !vf)
+ 			kfd->device_info.needs_pci_atomics = true;
+ 	}
+ }
