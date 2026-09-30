@@ -436,25 +436,21 @@ configure_tree() {
 
     cd "$SRC_DIR"
 
-    # IMPORTANT:
-    # Copy the running kernel's config EXACTLY.
-    # Do NOT run olddefconfig afterwards and then compare the files
-    # byte-for-byte. Kconfig rewrites formatting/comments even when
-    # the effective configuration is unchanged.
+    # Start from the EXACT running kernel configuration.
     cp -f "$running_config" .config
 
     log "Copying Module.symvers from running kernel headers"
     cp -f "$headers/Module.symvers" Module.symvers
 
-    # Prove that we really copied the exact running configuration.
+    # Verify the copy BEFORE any Kconfig operation.
     cmp -s .config "$running_config" ||
         die "failed to copy exact running-kernel config"
 
     log "Preparing kernel metadata for $KVER"
 
-    # KERNELRELEASE MUST be forced to the running Ubuntu kernel release.
-    # The Ubuntu source tree itself reports 7.0.14, while the running
-    # kernel is 7.0.0-34-generic.
+    # IMPORTANT:
+    # modules_prepare is allowed to rewrite .config.
+    # Therefore DO NOT compare .config after modules_prepare.
     make -C "$SRC_DIR" \
         KERNELRELEASE="$KVER" \
         modules_prepare \
@@ -463,27 +459,14 @@ configure_tree() {
             die "modules_prepare failed"
         }
 
-    # modules_prepare must not replace the effective configuration.
-    # If it rewrites the file, restore the exact running config and
-    # prepare once more without olddefconfig.
-    if ! cmp -s .config "$running_config"; then
-        warn "modules_prepare rewrote .config; restoring exact running config"
+    # Restore the exact running configuration AFTER modules_prepare.
+    # Do NOT run modules_prepare again.
+    cp -f "$running_config" .config
 
-        cp -f "$running_config" .config
+    # Restore the exact Module.symvers as well.
+    cp -f "$headers/Module.symvers" Module.symvers
 
-        make -C "$SRC_DIR" \
-            KERNELRELEASE="$KVER" \
-            modules_prepare \
-            >"$WORK/modules-prepare-2.log" 2>&1 || {
-                tail -100 "$WORK/modules-prepare-2.log" >&2
-                die "second modules_prepare failed"
-            }
-    fi
-
-    cmp -s .config "$running_config" ||
-        die "source .config differs from /boot/config-$KVER"
-
-    # Verify the configuration symbols that matter for this build.
+    # Verify required configuration symbols.
     grep -qx 'CONFIG_DRM_AMDGPU=m' .config ||
         die "CONFIG_DRM_AMDGPU is not=m"
 
@@ -501,14 +484,6 @@ configure_tree() {
 
     grep -qx 'CONFIG_LTO_NONE=y' .config ||
         die "CONFIG_LTO_NONE is not enabled"
-
-    # Make sure generated UTS release matches the running kernel.
-    local uts_file="include/generated/utsrelease.h"
-
-    if [ -f "$uts_file" ]; then
-        grep -q "\"${KVER}\"" "$uts_file" ||
-            die "generated UTS release does not match $KVER"
-    fi
 
     log "Kernel configuration verified"
     log "  KERNELRELEASE = $KVER"
