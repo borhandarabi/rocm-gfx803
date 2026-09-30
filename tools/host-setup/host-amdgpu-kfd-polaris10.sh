@@ -160,16 +160,6 @@ fetch_source() {
     [ -n "$source_pkg" ] ||
         die "cannot determine the source package for kernel $KVER; pass --source-dir"
 
-    source_ver="$(
-        apt-cache showsrc "$source_pkg" 2>/dev/null |
-        awk -v pkg="$source_pkg" '
-            $1 == "Package:" && $2 == pkg { found=1; next }
-            found && $1 == "Version:" { print $2; exit }
-        '
-    )"
-
-    [ -n "$source_ver" ] || source_ver="$want"
-
     src_list="$WORK/gfx803-deb-src.sources"
     lists_dir="$WORK/apt-lists"
 
@@ -209,20 +199,41 @@ fetch_source() {
         </dev/null ||
         die "failed to update the kernel deb-src indexes"
 
-    source_ver="$(
-        apt-cache \
-            -o Dir::Etc::sourcelist="$src_list" \
-            -o Dir::Etc::sourceparts="-" \
-            -o Dir::State::lists="$lists_dir" \
-            showsrc "$source_pkg" 2>/dev/null |
-        awk -v pkg="$source_pkg" '
-            $1 == "Package:" && $2 == pkg { found=1; next }
-            found && $1 == "Version:" { print $2; exit }
-        '
-    )"
+    source_ver="$want"
 
-    [ -n "$source_ver" ] ||
-        die "source package $source_pkg is not available from the configured deb-src archives"
+    if ! apt-cache \
+        -o Dir::Etc::sourcelist="$src_list" \
+        -o Dir::Etc::sourceparts="-" \
+        -o Dir::State::lists="$lists_dir" \
+        showsrc "${source_pkg}=${source_ver}" >/dev/null 2>&1
+    then
+        if [ "$ALLOW_MISMATCH" = 1 ]; then
+            source_ver="$(
+                apt-cache \
+                    -o Dir::Etc::sourcelist="$src_list" \
+                    -o Dir::Etc::sourceparts="-" \
+                    -o Dir::State::lists="$lists_dir" \
+                    showsrc "$source_pkg" 2>/dev/null |
+                awk -v pkg="$source_pkg" '
+                    $1 == "Package:" {
+                        found = ($2 == pkg)
+                        next
+                    }
+                    found && $1 == "Version:" {
+                        print $2
+                        exit
+                    }
+                '
+            )"
+
+            [ -n "$source_ver" ] ||
+                die "no source version is available for $source_pkg"
+
+            warn "exact source version $want is not available; using $source_pkg=$source_ver because --allow-source-mismatch was specified"
+        else
+            die "$source_pkg=$want is not available from the configured deb-src archives; pass --source-dir or --allow-source-mismatch"
+        fi
+    fi
 
     mkdir -p "$WORK/src"
     cd "$WORK/src"
