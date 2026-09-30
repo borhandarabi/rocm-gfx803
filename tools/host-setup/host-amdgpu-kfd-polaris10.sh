@@ -132,24 +132,41 @@ enable_deb_src() {
     fi
 
     local list
+    local src_list="$WORK/gfx803-deb-src.sources"
+    local lists_dir="$WORK/apt-lists"
+
+    mkdir -p "$lists_dir/partial"
 
     for list in \
         /etc/apt/sources.list.d/ubuntu.sources \
-        /etc/apt/sources.list.d/debian.sources
+        /etc/apt/sources.list.d/debian.sources \
+        /etc/apt/sources.list
     do
         [ -f "$list" ] || continue
 
-        DEB_SRC_LIST="$WORK/gfx803-deb-src.sources"
-
-        sed 's/^Types:.*/Types: deb-src/' "$list" > "$DEB_SRC_LIST"
+        case "$list" in
+            *.sources)
+                sed 's/^Types:.*/Types: deb-src/' "$list" > "$src_list"
+                ;;
+            *)
+                sed \
+                    -e '/^[[:space:]]*deb[[:space:]]/s/^[[:space:]]*deb[[:space:]]/deb-src /' \
+                    "$list" > "$src_list"
+                ;;
+        esac
 
         log "Updating only the kernel deb-src indexes"
 
         apt-get update \
-            -o Dir::Etc::sourcelist="$DEB_SRC_LIST" \
+            -o Dir::Etc::sourcelist="$src_list" \
             -o Dir::Etc::sourceparts="-" \
+            -o Dir::State::lists="$lists_dir" \
             -o APT::Get::List-Cleanup="0" \
             </dev/null
+
+        DEB_SRC_LIST="$src_list"
+        APT_SOURCE_LIST="$src_list"
+        APT_LISTS_DIR="$lists_dir"
 
         return 0
     done
@@ -159,29 +176,66 @@ enable_deb_src() {
 
 fetch_source() {
     if [ -n "$SRC_DIR" ]; then
-        [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] || die "$SRC_DIR is not a kernel source root"
+        [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
+            die "$SRC_DIR is not a kernel source root"
         return 0
     fi
+
     local want have out
+
     want="$(running_source_version)"
-    [ -n "$want" ] || die "cannot tell which source version kernel $KVER was built from; pass --source-dir"
+    [ -n "$want" ] ||
+        die "cannot tell which source version kernel $KVER was built from; pass --source-dir"
+
     enable_deb_src
+
+    [ -n "${APT_SOURCE_LIST:-}" ] ||
+        die "internal error: APT_SOURCE_LIST was not set by enable_deb_src"
+
+    [ -n "${APT_LISTS_DIR:-}" ] ||
+        die "internal error: APT_LISTS_DIR was not set by enable_deb_src"
+
     mkdir -p "$WORK/src"
     cd "$WORK/src"
+
     log "Fetching kernel source package linux=$want (about 250 MB download)"
-    if ! apt-get source "linux=$want" </dev/null; then
+
+    if ! apt-get \
+        -o Dir::Etc::sourcelist="$APT_SOURCE_LIST" \
+        -o Dir::Etc::sourceparts="-" \
+        -o Dir::State::lists="$APT_LISTS_DIR" \
+        source "linux=$want" </dev/null
+    then
         if [ "$ALLOW_MISMATCH" = 1 ]; then
             warn "linux=$want is no longer in the archive; using the newest source"
-            apt-get source linux </dev/null
+
+            apt-get \
+                -o Dir::Etc::sourcelist="$APT_SOURCE_LIST" \
+                -o Dir::Etc::sourceparts="-" \
+                -o Dir::State::lists="$APT_LISTS_DIR" \
+                source linux </dev/null ||
+                die "failed to fetch the newest linux source package"
         else
             die "linux=$want is not available from the archive. Pass --source-dir with the exact source, or --allow-source-mismatch to accept the newest one"
         fi
     fi
+
     out="$(find "$WORK/src" -maxdepth 1 -mindepth 1 -type d -name 'linux*' | head -1)"
-    [ -n "$out" ] || die "apt-get source produced no source directory"
+
+    [ -n "$out" ] ||
+        die "apt-get source produced no source directory"
+
     SRC_DIR="$out"
-    have="$(dpkg-parsechangelog -l "$SRC_DIR/debian.master/changelog" -S Version 2>/dev/null || true)"
-    if [ -n "$have" ] && [ "$have" != "$want" ] && [ "$ALLOW_MISMATCH" = 0 ]; then
+
+    have="$(
+        dpkg-parsechangelog \
+            -l "$SRC_DIR/debian.master/changelog" \
+            -S Version 2>/dev/null || true
+    )"
+
+    if [ -n "$have" ] &&
+       [ "$have" != "$want" ] &&
+       [ "$ALLOW_MISMATCH" = 0 ]; then
         die "unpacked source is $have but the running kernel is $want"
     fi
 }
