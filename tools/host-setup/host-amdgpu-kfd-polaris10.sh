@@ -58,21 +58,60 @@ trap cleanup EXIT
 parse_args() {
     while [ $# -gt 0 ]; do
         case "$1" in
-            --build-only) BUILD_ONLY=1 ;;
-            --uninstall) UNINSTALL=1 ;;
-            --patch-only) PATCH_ONLY=1 ;;
-            --source-dir) SRC_DIR="${2:?--source-dir needs a directory}"; shift ;;
-            --sign-key) SIGN_KEY="${2:?--sign-key needs a file}"; shift ;;
-            --sign-cert) SIGN_CERT="${2:?--sign-cert needs a file}"; shift ;;
-            --allow-source-mismatch) ALLOW_MISMATCH=1 ;;
-            --no-initramfs) DO_INITRAMFS=0 ;;
-            --workdir) WORK="${2:?--workdir needs a directory}"; shift ;;
-            --jobs) JOBS="${2:?--jobs needs a number}"; shift ;;
-            -h|--help) sed -n '2,/^set -euo/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'; exit 0 ;;
-            *) die "unknown option: $1" ;;
+            --build-only)
+                BUILD_ONLY=1
+                ;;
+            --uninstall)
+                UNINSTALL=1
+                ;;
+            --patch-only)
+                PATCH_ONLY=1
+                ;;
+            --source-dir)
+                SRC_DIR="${2:?--source-dir needs a directory}"
+                shift
+                ;;
+            --sign-key)
+                SIGN_KEY="${2:?--sign-key needs a file}"
+                shift
+                ;;
+            --sign-cert)
+                SIGN_CERT="${2:?--sign-cert needs a file}"
+                shift
+                ;;
+            --allow-source-mismatch)
+                ALLOW_MISMATCH=1
+                ;;
+            --no-initramfs)
+                DO_INITRAMFS=0
+                ;;
+            --workdir)
+                WORK="${2:?--workdir needs a directory}"
+                shift
+                ;;
+            --jobs)
+                JOBS="${2:?--jobs needs a number}"
+                shift
+                ;;
+            -h|--help)
+                sed -n '2,/^set -euo/p' "$0" |
+                    sed '$d' |
+                    sed 's/^# \{0,1\}//'
+                exit 0
+                ;;
+            *)
+                die "unknown option: $1"
+                ;;
         esac
         shift
     done
+
+    case "$JOBS" in
+        ''|*[!0-9]*|0)
+            die "--jobs must be a positive integer"
+            ;;
+    esac
+
     if [ "$PATCH_ONLY" = 1 ] && [ -z "$SRC_DIR" ]; then
         die "--patch-only needs --source-dir"
     fi
@@ -81,38 +120,73 @@ parse_args() {
 require_host() {
     [ "$(id -u)" -eq 0 ] || die "run as root (sudo)"
     [ "$(uname -m)" = "x86_64" ] || die "x86_64 only"
-    command -v apt-get >/dev/null || die "this script needs an apt-based host (Ubuntu/Debian)"
+    command -v apt-get >/dev/null ||
+        die "this script needs an apt-based host (Ubuntu/Debian)"
 }
 
 install_deps() {
     log "Installing build dependencies"
-    local pkgs="build-essential bc bison flex libelf-dev libdw-dev libssl-dev libncurses-dev dwarves rsync kmod cpio zstd xz-utils patch curl ca-certificates dpkg-dev initramfs-tools"
+
+    local pkgs="
+        build-essential
+        bc
+        bison
+        flex
+        libelf-dev
+        libdw-dev
+        libssl-dev
+        libncurses-dev
+        dwarves
+        rsync
+        kmod
+        cpio
+        zstd
+        xz-utils
+        patch
+        curl
+        ca-certificates
+        dpkg-dev
+        initramfs-tools
+    "
+
     if [ "$PATCH_ONLY" = 0 ]; then
         pkgs="$pkgs linux-headers-${KVER}"
     fi
+
     # shellcheck disable=SC2086
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends $pkgs </dev/null
+    DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y --no-install-recommends $pkgs </dev/null
 }
 
 # The .sh driver is the one place that applies the patch and proves the hunk
 # landed, so it is fetched together with the patch instead of duplicated here.
 fetch_patch() {
     local dest="$WORK/patch" local_dir="" f
+
     mkdir -p "$dest"
+
     if [ -f "${BASH_SOURCE[0]:-}" ]; then
-        local_dir="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/../../patches/kernel"
+        local_dir="$(
+            CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &&
+            pwd
+        )/../../patches/kernel"
     fi
+
     for f in "$PATCH_NAME.patch" "$PATCH_NAME.sh"; do
         if [ -n "$local_dir" ] && [ -f "$local_dir/$f" ]; then
             cp "$local_dir/$f" "$dest/$f"
         else
             log "Downloading $f"
-            curl -fsSL "$RAW_BASE/patches/kernel/$f" -o "$dest/$f" \
-                || die "could not download $RAW_BASE/patches/kernel/$f (is the patch pushed to that ref?)"
+            curl -fsSL \
+                "$RAW_BASE/patches/kernel/$f" \
+                -o "$dest/$f" ||
+                die "could not download $RAW_BASE/patches/kernel/$f (is the patch pushed to that ref?)"
         fi
     done
-    head -1 "$dest/$PATCH_NAME.patch" | grep -q "HOST KERNEL PATCH" \
-        || die "$dest/$PATCH_NAME.patch is not the expected patch file"
+
+    head -1 "$dest/$PATCH_NAME.patch" |
+        grep -q "HOST KERNEL PATCH" ||
+        die "$dest/$PATCH_NAME.patch is not the expected patch file"
 }
 
 # Return the source version recorded by the installed kernel package.
@@ -125,10 +199,45 @@ running_source_version() {
         || true
 }
 
+validate_source_dir() {
+    [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
+        die "$SRC_DIR is not a kernel source root"
+
+    [ -f "$SRC_DIR/debian.master/changelog" ] ||
+        die "$SRC_DIR does not contain debian.master/changelog"
+
+    local want have want_base
+
+    want="$(running_source_version)"
+
+    [ -n "$want" ] ||
+        die "cannot tell which source version kernel $KVER was built from"
+
+    have="$(
+        dpkg-parsechangelog \
+            -l "$SRC_DIR/debian.master/changelog" \
+            -S Version 2>/dev/null || true
+    )"
+
+    want_base="${want%%~*}"
+
+    if [ -n "$have" ] &&
+       [ "$have" != "$want" ] &&
+       [ "$have" != "$want_base" ] &&
+       [ "$ALLOW_MISMATCH" = 0 ]; then
+        die "unpacked source is $have but the running kernel is $want"
+    fi
+
+    if [ -n "$have" ] &&
+       [ "$have" != "$want" ] &&
+       [ "$have" != "$want_base" ]; then
+        warn "source version $have differs from running kernel package $want"
+    fi
+}
+
 fetch_source() {
     if [ -n "$SRC_DIR" ]; then
-        [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
-            die "$SRC_DIR is not a kernel source root"
+        validate_source_dir
         return 0
     fi
 
@@ -276,7 +385,7 @@ fetch_source() {
 
     SRC_DIR="$out"
 
-        have="$(
+    have="$(
         dpkg-parsechangelog \
             -l "$SRC_DIR/debian.master/changelog" \
             -S Version 2>/dev/null || true
@@ -292,88 +401,224 @@ fetch_source() {
     fi
 }
 
-
 apply_patch() {
     log "Applying $PATCH_NAME to $SRC_DIR"
     sh "$WORK/patch/$PATCH_NAME.sh" "$SRC_DIR"
 }
 
-# vermagic and symbol CRCs must equal the running kernel's, so the tree is
-# configured from the running kernel's own config and Module.symvers, and
-# KERNELRELEASE is forced to `uname -r` (the packaging derives it outside the
-# source tree). BTF and module signing are switched off: they add nothing to
-# a module built for this one machine, and their inputs (vmlinux, the
-# distribution signing certificates) are not in a source-only tree.
+# Configure the source tree exactly like the running Ubuntu kernel.
+#
+# Two details are essential:
+#
+# 1. /boot/config-$KVER must be used unchanged. In particular,
+#    CONFIG_DEBUG_INFO_BTF_MODULES and the other module-related options affect
+#    the kernel's struct module layout. Using a generic/source-tree .config
+#    produced a cleanup_module relocation at 0x490, while the running kernel
+#    expects 0x4a8.
+#
+# 2. Ubuntu's packaged kernel has a distro-specific KERNELRELEASE such as
+#    7.0.0-34-generic even though the source Makefile is based on upstream
+#    7.0.14. KERNELRELEASE must therefore be forced to uname -r.
 configure_tree() {
     local headers="/usr/src/linux-headers-${KVER}"
-    [ -f "/boot/config-${KVER}" ] || die "/boot/config-${KVER} not found"
-    [ -f "$headers/Module.symvers" ] || die "$headers/Module.symvers not found (install linux-headers-${KVER})"
+    local generated_release config_hash_running config_hash_source
+
+    [ -f "/boot/config-${KVER}" ] ||
+        die "/boot/config-${KVER} not found"
+
+    [ -f "$headers/Module.symvers" ] ||
+        die "$headers/Module.symvers not found (install linux-headers-${KVER})"
+
+    [ -f "$headers/include/generated/utsrelease.h" ] ||
+        die "$headers/include/generated/utsrelease.h not found"
+
     cd "$SRC_DIR"
-    cp "/boot/config-${KVER}" .config
-    cp "$headers/Module.symvers" Module.symvers
-    scripts/config --file .config \
-        -d DEBUG_INFO_BTF -d DEBUG_INFO_BTF_MODULES \
-        -d MODULE_SIG_ALL -d MODULE_SIG_FORCE \
-        --set-str SYSTEM_TRUSTED_KEYS "" \
-        --set-str SYSTEM_REVOCATION_KEYS ""
-    make KERNELRELEASE="$KVER" olddefconfig >"$WORK/olddefconfig.log" 2>&1 \
-        || { tail -20 "$WORK/olddefconfig.log" >&2; die "make olddefconfig failed"; }
-    grep -q '^CONFIG_DRM_AMDGPU=m' .config || die "the running kernel does not build amdgpu as a module"
-    grep -q '^CONFIG_HSA_AMD=y' .config || die "the running kernel is built without CONFIG_HSA_AMD"
+
+    log "Synchronizing exact running-kernel config"
+    cp -f "/boot/config-${KVER}" .config
+
+    log "Copying Module.symvers from running kernel headers"
+    cp -f "$headers/Module.symvers" Module.symvers
+
+    log "Preparing kernel metadata for $KVER"
+
+    make \
+        KERNELRELEASE="$KVER" \
+        olddefconfig \
+        >"$WORK/olddefconfig.log" 2>&1 ||
+        {
+            tail -30 "$WORK/olddefconfig.log" >&2
+            die "make olddefconfig failed; full log: $WORK/olddefconfig.log"
+        }
+
+    make \
+        KERNELRELEASE="$KVER" \
+        modules_prepare \
+        >"$WORK/prepare.log" 2>&1 ||
+        {
+            tail -30 "$WORK/prepare.log" >&2
+            die "modules_prepare failed; full log: $WORK/prepare.log"
+        }
+
+    generated_release="$(
+        sed -n \
+            's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
+            include/generated/utsrelease.h
+    )"
+
+    [ "$generated_release" = "$KVER" ] ||
+        die "generated UTS_RELEASE '$generated_release' does not match running kernel '$KVER'"
+
+    config_hash_running="$(sha256sum "/boot/config-${KVER}" | awk '{print $1}')"
+    config_hash_source="$(sha256sum .config | awk '{print $1}')"
+
+    [ "$config_hash_running" = "$config_hash_source" ] ||
+        die "source .config differs from /boot/config-${KVER}"
+
+    grep -q '^CONFIG_DRM_AMDGPU=m$' .config ||
+        die "the running kernel does not build amdgpu as a module"
+
+    grep -q '^CONFIG_HSA_AMD=y$' .config ||
+        die "the running kernel is built without CONFIG_HSA_AMD"
+
+    log "Verified KERNELRELEASE=$KVER"
+    log "Verified UTS_RELEASE=$generated_release"
+    log "Verified exact kernel config"
 }
 
 build_module() {
-    log "Preparing the tree (modules_prepare)"
-    make KERNELRELEASE="$KVER" -j"$JOBS" modules_prepare >"$WORK/prepare.log" 2>&1 \
-        || { tail -30 "$WORK/prepare.log" >&2; die "modules_prepare failed, full log: $WORK/prepare.log"; }
-    log "Building amdgpu.ko (this takes a while)"
-    make KERNELRELEASE="$KVER" -j"$JOBS" M=drivers/gpu/drm/amd/amdgpu modules >"$WORK/build.log" 2>&1 \
-        || { tail -40 "$WORK/build.log" >&2; die "module build failed, full log: $WORK/build.log"; }
+    cd "$SRC_DIR"
+
+    log "Cleaning previous amdgpu module build"
+    make \
+        KERNELRELEASE="$KVER" \
+        M=drivers/gpu/drm/amd/amdgpu \
+        clean \
+        >"$WORK/clean.log" 2>&1 ||
+        {
+            tail -30 "$WORK/clean.log" >&2
+            die "amdgpu clean failed; full log: $WORK/clean.log"
+        }
+
+    log "Building amdgpu.ko with $JOBS parallel job(s)"
+
+    make \
+        KERNELRELEASE="$KVER" \
+        -j"$JOBS" \
+        M=drivers/gpu/drm/amd/amdgpu \
+        modules \
+        >"$WORK/build.log" 2>&1 ||
+        {
+            tail -50 "$WORK/build.log" >&2
+            die "module build failed; full log: $WORK/build.log"
+        }
 }
 
 verify_module() {
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
     local kfd_src="$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c"
+    local vermagic
+    local generated_release
+    local relocation
+    local expected_relocation
 
-    [ -f "$ko" ] || die "amdgpu.ko was not produced"
+    [ -f "$ko" ] ||
+        die "amdgpu.ko was not produced"
 
-    modinfo -F vermagic "$ko" | grep -q "^${KVER} " \
-        || die "vermagic '$(modinfo -F vermagic "$ko")' does not start with '$KVER'"
+    [ -f "$kfd_src" ] ||
+        die "KFD source is missing: $kfd_src"
 
-    [ -f "$kfd_src" ] || die "KFD source is missing: $kfd_src"
+    generated_release="$(
+        sed -n \
+            's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
+            "$SRC_DIR/include/generated/utsrelease.h"
+    )"
 
-    grep -q 'asic_type != CHIP_POLARIS10' "$kfd_src" \
-        || die "KFD source does not contain the Polaris10 PCI-atomics exemption"
+    [ "$generated_release" = "$KVER" ] ||
+        die "module tree UTS_RELEASE '$generated_release' does not match '$KVER'"
 
-    grep -q 'asic_type != CHIP_HAWAII &&' "$kfd_src" \
-        || die "KFD source does not contain the expected atomics gate"
+    vermagic="$(modinfo -F vermagic "$ko")"
 
-    grep -q 'kfd->device_info.needs_pci_atomics = true' "$kfd_src" \
-        || die "KFD source has no PCI-atomics gate; wrong kernel tree"
+    printf '%s\n' "$vermagic" |
+        grep -q "^${KVER} " ||
+        die "vermagic '$vermagic' does not start with '$KVER'"
+
+    grep -q 'asic_type != CHIP_POLARIS10' "$kfd_src" ||
+        die "KFD source does not contain the Polaris10 PCI-atomics exemption"
+
+    grep -q 'asic_type != CHIP_HAWAII &&' "$kfd_src" ||
+        die "KFD source does not contain the expected atomics gate"
+
+    grep -q 'kfd->device_info.needs_pci_atomics = true' "$kfd_src" ||
+        die "KFD source has no PCI-atomics gate; wrong kernel tree"
+
+    relocation="$(
+        readelf -rW "$ko" |
+        awk '
+            /\.rela\.gnu\.linkonce\.this_module/ {
+                in_section=1
+                next
+            }
+            in_section && /cleanup_module/ {
+                print $1
+                exit
+            }
+            in_section && /^Relocation section / && !/\.rela\.gnu\.linkonce\.this_module/ {
+                exit
+            }
+        '
+    )"
+
+    expected_relocation="00000000000004a8"
+
+    [ "$relocation" = "$expected_relocation" ] ||
+        die "unexpected cleanup_module relocation '$relocation'; expected $expected_relocation"
 
     log "Verified patched KFD source for Polaris10"
-    log "Built $ko (vermagic: $(modinfo -F vermagic "$ko"))"
+    log "Verified UTS_RELEASE: $generated_release"
+    log "Verified vermagic: $vermagic"
+    log "Verified struct module cleanup_module relocation: 0x4a8"
+    log "Built $ko"
 }
 
 secure_boot_enabled() {
-    command -v mokutil >/dev/null && mokutil --sb-state 2>/dev/null | grep -qi 'enabled'
+    command -v mokutil >/dev/null &&
+        mokutil --sb-state 2>/dev/null |
+        grep -qi 'enabled'
 }
 
 sign_module() {
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
+
     secure_boot_enabled || return 0
-    if [ -z "$SIGN_KEY" ] && [ -f /var/lib/shim-signed/mok/MOK.priv ] && [ -f /var/lib/shim-signed/mok/MOK.der ]; then
+
+    if [ -z "$SIGN_KEY" ] &&
+       [ -f /var/lib/shim-signed/mok/MOK.priv ] &&
+       [ -f /var/lib/shim-signed/mok/MOK.der ]; then
         SIGN_KEY=/var/lib/shim-signed/mok/MOK.priv
         SIGN_CERT=/var/lib/shim-signed/mok/MOK.der
     fi
+
     if [ -z "$SIGN_KEY" ] || [ -z "$SIGN_CERT" ]; then
-        [ "$BUILD_ONLY" = 1 ] && { warn "Secure Boot is on and no signing key was given; the module would not load"; return 0; }
+        if [ "$BUILD_ONLY" = 1 ]; then
+            warn "Secure Boot is on and no signing key was given; the module would not load"
+            return 0
+        fi
+
         die "Secure Boot is enabled, so the module must be signed with an enrolled key. Pass --sign-key and --sign-cert, or use --build-only"
     fi
-    mokutil --test-key "$SIGN_CERT" 2>&1 | grep -qi 'already enrolled' \
-        || die "$SIGN_CERT is not enrolled in the MOK list; the firmware would reject the module"
+
+    mokutil --test-key "$SIGN_CERT" 2>&1 |
+        grep -qi 'already enrolled' ||
+        die "$SIGN_CERT is not enrolled in the MOK list; the firmware would reject the module"
+
     log "Signing amdgpu.ko"
-    "/usr/src/linux-headers-${KVER}/scripts/sign-file" sha512 "$SIGN_KEY" "$SIGN_CERT" "$ko"
+
+    "/usr/src/linux-headers-${KVER}/scripts/sign-file" \
+        sha512 \
+        "$SIGN_KEY" \
+        "$SIGN_CERT" \
+        "$ko"
 }
 
 # `updates/` outranks `kernel/` in depmod's search order, which leaves the stock
@@ -381,11 +626,16 @@ sign_module() {
 install_module() {
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
     local dest="/lib/modules/${KVER}/updates/amdgpu.ko"
+
     log "Installing $dest"
+
     install -D -m 0644 "$ko" "$dest"
+
     depmod -a "$KVER"
-    [ "$(modinfo -k "$KVER" -n amdgpu)" = "$dest" ] \
-        || die "depmod still resolves amdgpu to $(modinfo -k "$KVER" -n amdgpu), not $dest"
+
+    [ "$(modinfo -k "$KVER" -n amdgpu)" = "$dest" ] ||
+        die "depmod still resolves amdgpu to $(modinfo -k "$KVER" -n amdgpu), not $dest"
+
     if [ "$DO_INITRAMFS" = 1 ]; then
         log "Rebuilding the initramfs"
         update-initramfs -u -k "$KVER"
@@ -394,11 +644,19 @@ install_module() {
 
 uninstall_module() {
     local dest="/lib/modules/${KVER}/updates/amdgpu.ko"
+
     if [ -f "$dest" ]; then
         rm -f "$dest"
-        rmdir --ignore-fail-on-non-empty "/lib/modules/${KVER}/updates" 2>/dev/null || true
+        rmdir \
+            --ignore-fail-on-non-empty \
+            "/lib/modules/${KVER}/updates" \
+            2>/dev/null || true
+
         depmod -a "$KVER"
-        [ "$DO_INITRAMFS" = 1 ] && update-initramfs -u -k "$KVER"
+
+        [ "$DO_INITRAMFS" = 1 ] &&
+            update-initramfs -u -k "$KVER"
+
         log "Removed $dest; the stock amdgpu loads again after a reboot"
     else
         log "Nothing to remove: $dest does not exist"
@@ -441,7 +699,11 @@ main() {
     fetch_patch
     fetch_source
     apply_patch
-    [ "$PATCH_ONLY" = 1 ] && { log "Patch applied to $SRC_DIR"; return 0; }
+
+    [ "$PATCH_ONLY" = 1 ] && {
+        log "Patch applied to $SRC_DIR"
+        return 0
+    }
 
     configure_tree
     build_module
