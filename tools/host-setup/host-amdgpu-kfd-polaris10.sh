@@ -32,6 +32,19 @@
 #              GFX803_RAW_BASE (override the raw file base URL).
 set -euo pipefail
 
+CURRENT_STAGE="startup"
+
+stage_start() {
+    CURRENT_STAGE="$1"
+    log "START: $CURRENT_STAGE"
+}
+
+stage_done() {
+    log "DONE: $CURRENT_STAGE"
+}
+
+trap 'rc=$?; if [ "$rc" -ne 0 ]; then printf "FATAL: stage=%s exit=%s line=%s\n" "$CURRENT_STAGE" "$rc" "${BASH_LINENO[0]:-unknown}" >&2; fi; exit "$rc"' ERR
+
 PATCH_NAME="amdkfd-polaris10-no-pci-atomics"
 RAW_BASE="${GFX803_RAW_BASE:-https://raw.githubusercontent.com/borhandarabi/rocm-gfx803/${GFX803_REF:-main}}"
 KVER="$(uname -r)"
@@ -125,6 +138,7 @@ require_host() {
 }
 
 install_deps() {
+    stage_start "install_deps"
     log "Installing build dependencies"
 
     local pkgs="
@@ -156,11 +170,14 @@ install_deps() {
     # shellcheck disable=SC2086
     DEBIAN_FRONTEND=noninteractive \
         apt-get install -y --no-install-recommends $pkgs </dev/null
+    log "Build dependencies are ready"
+    stage_done
 }
 
 # The .sh driver is the one place that applies the patch and proves the hunk
 # landed, so it is fetched together with the patch instead of duplicated here.
 fetch_patch() {
+    stage_start "fetch_patch"
     local dest="$WORK/patch" local_dir="" f
 
     mkdir -p "$dest"
@@ -187,6 +204,8 @@ fetch_patch() {
     head -1 "$dest/$PATCH_NAME.patch" |
         grep -q "HOST KERNEL PATCH" ||
         die "$dest/$PATCH_NAME.patch is not the expected patch file"
+    log "Patch files are ready"
+    stage_done
 }
 
 # Return the source version recorded by the installed kernel package.
@@ -236,6 +255,7 @@ validate_source_dir() {
 }
 
 fetch_source() {
+    stage_start "fetch_source"
     if [ -n "$SRC_DIR" ]; then
         validate_source_dir
         return 0
@@ -399,11 +419,18 @@ fetch_source() {
        [ "$ALLOW_MISMATCH" = 0 ]; then
         die "unpacked source is $have but the running kernel is $want"
     fi
+    log "Kernel source ready: $SRC_DIR"
+    stage_done
 }
 
 apply_patch() {
+    stage_start "apply_patch"
+
     log "Applying $PATCH_NAME to $SRC_DIR"
     sh "$WORK/patch/$PATCH_NAME.sh" "$SRC_DIR"
+
+    log "Patch application completed"
+    stage_done
 }
 
 # Configure the source tree exactly like the running Ubuntu kernel.
@@ -420,6 +447,7 @@ apply_patch() {
 #    7.0.0-34-generic even though the source Makefile is based on upstream
 #    7.0.14. KERNELRELEASE must therefore be forced to uname -r.
 configure_tree() {
+    stage_start "configure_tree"
     local headers="/usr/src/linux-headers-${KVER}"
     local running_config="/boot/config-${KVER}"
 
@@ -492,12 +520,16 @@ configure_tree() {
     log "  CONFIG_MODVERSIONS = $(grep '^CONFIG_MODVERSIONS=' .config)"
     log "  CONFIG_LTO_NONE = $(grep '^CONFIG_LTO_NONE=' .config)"
     log "  CONFIG_MODULES_USE_ELF_RELA = $(grep '^CONFIG_MODULES_USE_ELF_RELA=' .config)"
+    stage_done
 }
 
 build_module() {
+    stage_start "build_module"
+
     cd "$SRC_DIR"
 
-    log "Cleaning previous amdgpu module build"
+    log "BUILD 1/2: Cleaning previous amdgpu module build"
+
     make \
         KERNELRELEASE="$KVER" \
         M=drivers/gpu/drm/amd/amdgpu \
@@ -508,7 +540,9 @@ build_module() {
             die "amdgpu clean failed; full log: $WORK/clean.log"
         }
 
-    log "Building amdgpu.ko with $JOBS parallel job(s)"
+    log "DONE: amdgpu clean"
+
+    log "BUILD 2/2: Building amdgpu.ko with $JOBS parallel job(s)"
 
     make \
         KERNELRELEASE="$KVER" \
@@ -520,22 +554,37 @@ build_module() {
             tail -50 "$WORK/build.log" >&2
             die "module build failed; full log: $WORK/build.log"
         }
+
+    [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko" ] ||
+        die "make returned successfully but amdgpu.ko is missing"
+
+    log "PASS: amdgpu.ko was produced"
+    log "Build log: $WORK/build.log"
+
+    stage_done
 }
 
 verify_module() {
+    stage_start "verify_module"
+
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
     local kfd_src="$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c"
     local vermagic
     local generated_release
     local relocation
-    local expected_relocation
+    local expected_relocation="00000000000004a8"
 
+    log "VERIFY 1/8: amdgpu.ko exists"
     [ -f "$ko" ] ||
-        die "amdgpu.ko was not produced"
+        die "amdgpu.ko was not produced: $ko"
+    log "PASS: amdgpu.ko exists"
 
+    log "VERIFY 2/8: KFD source exists"
     [ -f "$kfd_src" ] ||
         die "KFD source is missing: $kfd_src"
+    log "PASS: KFD source exists"
 
+    log "VERIFY 3/8: UTS_RELEASE"
     generated_release="$(
         sed -n \
             's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
@@ -545,11 +594,18 @@ verify_module() {
     [ "$generated_release" = "$KVER" ] ||
         die "module tree UTS_RELEASE '$generated_release' does not match '$KVER'"
 
+    log "PASS: UTS_RELEASE=$generated_release"
+
+    log "VERIFY 4/8: module vermagic"
     vermagic="$(modinfo -F vermagic "$ko")"
 
     printf '%s\n' "$vermagic" |
         grep -q "^${KVER} " ||
         die "vermagic '$vermagic' does not start with '$KVER'"
+
+    log "PASS: vermagic=$vermagic"
+
+    log "VERIFY 5/8: Polaris10 KFD PCI-atomics exemption"
 
     grep -q 'asic_type != CHIP_POLARIS10' "$kfd_src" ||
         die "KFD source does not contain the Polaris10 PCI-atomics exemption"
@@ -560,33 +616,59 @@ verify_module() {
     grep -q 'kfd->device_info.needs_pci_atomics = true' "$kfd_src" ||
         die "KFD source has no PCI-atomics gate; wrong kernel tree"
 
+    log "PASS: Polaris10 PCI-atomics exemption is present"
+
+    log "VERIFY 6/8: readelf relocation table"
+
+    if ! readelf -rW "$ko" >"$WORK/amdgpu-relocations.txt" 2>"$WORK/readelf.err"; then
+        cat "$WORK/readelf.err" >&2
+        die "readelf failed for $ko"
+    fi
+
+    log "PASS: relocation table readable"
+
+    log "VERIFY 7/8: cleanup_module relocation"
+
     relocation="$(
-        readelf -rW "$ko" |
         awk '
             /\.rela\.gnu\.linkonce\.this_module/ {
                 in_section=1
                 next
             }
+
             in_section && /cleanup_module/ {
                 print $1
                 exit
             }
-            in_section && /^Relocation section / && !/\.rela\.gnu\.linkonce\.this_module/ {
+
+            in_section &&
+            /^Relocation section / &&
+            !/\.rela\.gnu\.linkonce\.this_module/ {
                 exit
             }
-        '
+        ' "$WORK/amdgpu-relocations.txt"
     )"
 
-    expected_relocation="00000000000004a8"
-
     [ "$relocation" = "$expected_relocation" ] ||
-        die "unexpected cleanup_module relocation '$relocation'; expected $expected_relocation"
+        die \
+            "unexpected cleanup_module relocation '$relocation'; expected $expected_relocation"
+
+    log "PASS: cleanup_module relocation=0x4a8"
+
+    log "VERIFY 8/8: module metadata"
+
+    log "  file: $(file "$ko")"
+    log "  size: $(du -h "$ko" | awk '{print $1}')"
+
+    log "PASS: module metadata"
 
     log "Verified patched KFD source for Polaris10"
     log "Verified UTS_RELEASE: $generated_release"
     log "Verified vermagic: $vermagic"
     log "Verified struct module cleanup_module relocation: 0x4a8"
-    log "Built $ko"
+    log "Built: $ko"
+
+    stage_done
 }
 
 secure_boot_enabled() {
@@ -596,9 +678,17 @@ secure_boot_enabled() {
 }
 
 sign_module() {
+    stage_start "sign_module"
+
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
 
-    secure_boot_enabled || return 0
+    if ! secure_boot_enabled; then
+        log "Secure Boot is disabled; signing not required"
+        stage_done
+        return 0
+    fi
+
+    log "Secure Boot is enabled"
 
     if [ -z "$SIGN_KEY" ] &&
        [ -f /var/lib/shim-signed/mok/MOK.priv ] &&
@@ -609,16 +699,17 @@ sign_module() {
 
     if [ -z "$SIGN_KEY" ] || [ -z "$SIGN_CERT" ]; then
         if [ "$BUILD_ONLY" = 1 ]; then
-            warn "Secure Boot is on and no signing key was given; the module would not load"
+            warn "Secure Boot is on and no signing key was given; build completed but module is unsigned"
+            stage_done
             return 0
         fi
 
-        die "Secure Boot is enabled, so the module must be signed with an enrolled key. Pass --sign-key and --sign-cert, or use --build-only"
+        die "Secure Boot is enabled; signing key and certificate are required"
     fi
 
     mokutil --test-key "$SIGN_CERT" 2>&1 |
         grep -qi 'already enrolled' ||
-        die "$SIGN_CERT is not enrolled in the MOK list; the firmware would reject the module"
+        die "$SIGN_CERT is not enrolled in the MOK list"
 
     log "Signing amdgpu.ko"
 
@@ -627,27 +718,50 @@ sign_module() {
         "$SIGN_KEY" \
         "$SIGN_CERT" \
         "$ko"
+
+    log "PASS: module signed"
+
+    stage_done
 }
 
 # `updates/` outranks `kernel/` in depmod's search order, which leaves the stock
 # module on disk as the fallback and touches nothing the package manager owns.
 install_module() {
+    stage_start "install_module"
+
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
     local dest="/lib/modules/${KVER}/updates/amdgpu.ko"
 
-    log "Installing $dest"
+    log "Installing: $dest"
 
     install -D -m 0644 "$ko" "$dest"
 
+    log "Running depmod"
     depmod -a "$KVER"
 
-    [ "$(modinfo -k "$KVER" -n amdgpu)" = "$dest" ] ||
-        die "depmod still resolves amdgpu to $(modinfo -k "$KVER" -n amdgpu), not $dest"
+    local resolved
+    resolved="$(modinfo -k "$KVER" -n amdgpu)"
+
+    log "depmod resolves amdgpu to: $resolved"
+
+    [ "$resolved" = "$dest" ] ||
+        die "depmod still resolves amdgpu to $resolved, not $dest"
+
+    log "PASS: installed module is preferred by depmod"
 
     if [ "$DO_INITRAMFS" = 1 ]; then
-        log "Rebuilding the initramfs"
+        log "Rebuilding initramfs"
         update-initramfs -u -k "$KVER"
+        log "PASS: initramfs rebuilt"
+    else
+        log "Initramfs rebuild skipped (--no-initramfs)"
     fi
+
+    log "Installed module:"
+    modinfo -k "$KVER" amdgpu |
+        grep -E '^(filename|version|vermagic|srcversion):'
+
+    stage_done
 }
 
 uninstall_module() {
@@ -696,10 +810,21 @@ EOF
 main() {
     parse_args "$@"
     require_host
+
     mkdir -p "$WORK"
+
+    log "============================================================"
+    log "ROCm gfx803 native amdgpu/KFD host setup"
+    log "Kernel: $KVER"
+    log "Workdir: $WORK"
+    log "Jobs: $JOBS"
+    log "============================================================"
 
     if [ "$UNINSTALL" = 1 ]; then
         uninstall_module
+        log "============================================================"
+        log "ALL DONE: uninstall completed"
+        log "============================================================"
         return 0
     fi
 
@@ -708,10 +833,11 @@ main() {
     fetch_source
     apply_patch
 
-    [ "$PATCH_ONLY" = 1 ] && {
+    if [ "$PATCH_ONLY" = 1 ]; then
         log "Patch applied to $SRC_DIR"
+        log "ALL DONE: patch-only completed"
         return 0
-    }
+    fi
 
     configure_tree
     build_module
@@ -719,11 +845,21 @@ main() {
     sign_module
 
     if [ "$BUILD_ONLY" = 1 ]; then
-        log "Build only: module left at $SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
+        log "Build-only mode: installation skipped"
+        log "Module:"
+        log "  $SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
+        log "============================================================"
+        log "ALL DONE: BUILD + VERIFY completed successfully"
+        log "============================================================"
         return 0
     fi
+
     install_module
     print_next_steps
+
+    log "============================================================"
+    log "ALL DONE: BUILD + VERIFY + INSTALL completed successfully"
+    log "============================================================"
 }
 
 main "$@"
