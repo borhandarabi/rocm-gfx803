@@ -276,14 +276,17 @@ fetch_source() {
 
     SRC_DIR="$out"
 
-    have="$(
+        have="$(
         dpkg-parsechangelog \
             -l "$SRC_DIR/debian.master/changelog" \
             -S Version 2>/dev/null || true
     )"
 
+    want_base="${want%%~*}"
+
     if [ -n "$have" ] &&
        [ "$have" != "$want" ] &&
+       [ "$have" != "$want_base" ] &&
        [ "$ALLOW_MISMATCH" = 0 ]; then
         die "unpacked source is $have but the running kernel is $want"
     fi
