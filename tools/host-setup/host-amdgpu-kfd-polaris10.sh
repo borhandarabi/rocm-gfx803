@@ -130,15 +130,30 @@ enable_deb_src() {
     if apt-cache showsrc linux 2>/dev/null | grep -q '^Version:'; then
         return 0
     fi
+
     local list
-    for list in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list.d/debian.sources; do
+
+    for list in \
+        /etc/apt/sources.list.d/ubuntu.sources \
+        /etc/apt/sources.list.d/debian.sources
+    do
         [ -f "$list" ] || continue
-        DEB_SRC_LIST="/etc/apt/sources.list.d/gfx803-deb-src.sources"
+
+        DEB_SRC_LIST="$WORK/gfx803-deb-src.sources"
+
         sed 's/^Types:.*/Types: deb-src/' "$list" > "$DEB_SRC_LIST"
-        log "Enabling deb-src for the kernel source download"
-        apt-get update </dev/null >/dev/null
+
+        log "Updating only the kernel deb-src indexes"
+
+        apt-get update \
+            -o Dir::Etc::sourcelist="$DEB_SRC_LIST" \
+            -o Dir::Etc::sourceparts="-" \
+            -o APT::Get::List-Cleanup="0" \
+            </dev/null
+
         return 0
     done
+
     die "no deb-src apt source available; unpack the matching kernel source yourself and pass --source-dir"
 }
 
