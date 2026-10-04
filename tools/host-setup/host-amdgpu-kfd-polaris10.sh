@@ -15,6 +15,10 @@
 # against the running kernel's symbol CRCs, and a source tree that differs
 # from it can build a module that loads and misbehaves.
 #
+# The module is stripped of debug info and compressed like the stock one, so it
+# stays small (tens of MB instead of hundreds) and fits in the initramfs. A
+# modules-load.d entry makes amdgpu load on every boot without a manual modprobe.
+#
 # Usage: host-amdgpu-kfd-polaris10.sh [options]
 #   --build-only        build and verify, install nothing
 #   --uninstall         remove the installed module and rebuild the initramfs
@@ -26,11 +30,16 @@
 #                       accept a source package whose version differs from the
 #                       running kernel's
 #   --no-initramfs      skip update-initramfs
+#   --keep-workdir      keep the kernel source/build tree after installing
 #   --workdir DIR       scratch directory (default /var/tmp/gfx803-amdgpu)
 #   --jobs N            parallel make jobs (default: nproc)
 # Environment: GFX803_REF (git ref of this repo, default main),
 #              GFX803_RAW_BASE (override the raw file base URL).
-set -euo pipefail
+set -Eeuo pipefail
+
+log() { printf '==> %s\n' "$*"; }
+warn() { printf 'WARNING: %s\n' "$*" >&2; }
+die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 
 CURRENT_STAGE="startup"
 
@@ -43,7 +52,7 @@ stage_done() {
     log "DONE: $CURRENT_STAGE"
 }
 
-trap 'rc=$?; if [ "$rc" -ne 0 ]; then printf "FATAL: stage=%s exit=%s line=%s\n" "$CURRENT_STAGE" "$rc" "${BASH_LINENO[0]:-unknown}" >&2; fi; exit "$rc"' ERR
+trap 'rc=$?; printf "FATAL: stage=%s exit=%s line=%s\n" "$CURRENT_STAGE" "$rc" "${BASH_LINENO[0]:-unknown}" >&2; exit "$rc"' ERR
 
 PATCH_NAME="amdkfd-polaris10-no-pci-atomics"
 RAW_BASE="${GFX803_RAW_BASE:-https://raw.githubusercontent.com/borhandarabi/rocm-gfx803/${GFX803_REF:-main}}"
@@ -58,15 +67,8 @@ SIGN_KEY=""
 SIGN_CERT=""
 ALLOW_MISMATCH=0
 DO_INITRAMFS=1
-
-log() { printf '==> %s\n' "$*"; }
-warn() { printf 'WARNING: %s\n' "$*" >&2; }
-die() { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
-
-cleanup() {
-    return 0
-}
-trap cleanup EXIT
+KEEP_WORKDIR=0
+APT_SRC_OPTS=()
 
 parse_args() {
     while [ $# -gt 0 ]; do
@@ -98,6 +100,9 @@ parse_args() {
             --no-initramfs)
                 DO_INITRAMFS=0
                 ;;
+            --keep-workdir)
+                KEEP_WORKDIR=1
+                ;;
             --workdir)
                 WORK="${2:?--workdir needs a directory}"
                 shift
@@ -107,7 +112,7 @@ parse_args() {
                 shift
                 ;;
             -h|--help)
-                sed -n '2,/^set -euo/p' "$0" |
+                sed -n '2,/^set -/p' "$0" |
                     sed '$d' |
                     sed 's/^# \{0,1\}//'
                 exit 0
@@ -143,6 +148,7 @@ install_deps() {
 
     local pkgs="
         build-essential
+        binutils
         bc
         bison
         flex
@@ -158,6 +164,7 @@ install_deps() {
         xz-utils
         patch
         curl
+        file
         ca-certificates
         dpkg-dev
         initramfs-tools
@@ -208,50 +215,68 @@ fetch_patch() {
     stage_done
 }
 
-# Return the source version recorded by the installed kernel package.
-# The source package name is discovered separately because Ubuntu HWE kernels
-# may come from source packages such as linux-hwe-7.0 rather than `linux`.
-running_source_version() {
-    dpkg-query -W -f='${Version}' "linux-modules-${KVER}" 2>/dev/null \
-        || dpkg-query -W -f='${Version}' "linux-image-${KVER}" 2>/dev/null \
-        || dpkg-query -W -f='${Version}' "linux-image-unsigned-${KVER}" 2>/dev/null \
-        || true
+# Print a dpkg-query field (source:Package or source:Version) of the package
+# the running kernel came from. Ubuntu HWE kernels come from source packages
+# such as linux-hwe-7.0 rather than `linux`, so the name is discovered here.
+running_source_field() {
+    local field="$1" pkg value
+    for pkg in \
+        "linux-modules-${KVER}" \
+        "linux-image-${KVER}" \
+        "linux-image-unsigned-${KVER}"
+    do
+        value="$(
+            dpkg-query -W -f="\${${field}}\n" "$pkg" 2>/dev/null |
+            head -1 || true
+        )"
+        if [ -n "$value" ]; then
+            printf '%s\n' "$value"
+            return 0
+        fi
+    done
+    return 0
 }
 
-validate_source_dir() {
-    [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
-        die "$SRC_DIR is not a kernel source root"
+# Versions of a source package visible to the temporary deb-src indexes,
+# newest first.
+source_versions() {
+    apt-cache "${APT_SRC_OPTS[@]}" showsrc "$1" 2>/dev/null |
+        awk -v pkg="$1" '
+            $1 == "Package:" { found = ($2 == pkg); next }
+            found && $1 == "Version:" { print $2 }
+        ' || true
+}
 
-    [ -f "$SRC_DIR/debian.master/changelog" ] ||
-        die "$SRC_DIR does not contain debian.master/changelog"
-
+# Compare the changelog version of an unpacked tree with the running kernel's
+# source version. debian.master carries the base version without the
+# "~24.04.1" style suffix that HWE packages add.
+check_source_version() {
     local want have want_base
-
-    want="$(running_source_version)"
-
-    [ -n "$want" ] ||
-        die "cannot tell which source version kernel $KVER was built from"
+    want="$(running_source_field 'source:Version')"
+    [ -n "$want" ] || return 0
+    [ -f "$SRC_DIR/debian.master/changelog" ] || return 0
 
     have="$(
         dpkg-parsechangelog \
             -l "$SRC_DIR/debian.master/changelog" \
             -S Version 2>/dev/null || true
     )"
+    [ -n "$have" ] || return 0
 
     want_base="${want%%~*}"
 
-    if [ -n "$have" ] &&
-       [ "$have" != "$want" ] &&
-       [ "$have" != "$want_base" ] &&
-       [ "$ALLOW_MISMATCH" = 0 ]; then
-        die "unpacked source is $have but the running kernel is $want"
-    fi
-
-    if [ -n "$have" ] &&
-       [ "$have" != "$want" ] &&
-       [ "$have" != "$want_base" ]; then
+    if [ "$have" != "$want" ] && [ "$have" != "$want_base" ]; then
+        if [ "$ALLOW_MISMATCH" = 0 ]; then
+            die "unpacked source is $have but the running kernel is $want"
+        fi
         warn "source version $have differs from running kernel package $want"
     fi
+}
+
+validate_source_dir() {
+    [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c" ] ||
+        die "$SRC_DIR is not a kernel source root"
+    check_source_version
 }
 
 fetch_source() {
@@ -263,37 +288,19 @@ fetch_source() {
         return 0
     fi
 
-    local want source_pkg source_ver src_list lists_dir list out have
+    local want source_pkg source_ver avail src_list lists_dir list out
 
-    want="$(running_source_version)"
+    want="$(running_source_field 'source:Version')"
     [ -n "$want" ] ||
         die "cannot tell which source version kernel $KVER was built from; pass --source-dir"
 
-    source_pkg="$(
-        dpkg-query -W -f='${source:Package}\n' "linux-modules-${KVER}" 2>/dev/null |
-        head -1
-    )"
-
-    if [ -z "$source_pkg" ]; then
-        source_pkg="$(
-            dpkg-query -W -f='${source:Package}\n' "linux-image-${KVER}" 2>/dev/null |
-            head -1
-        )"
-    fi
-
-    if [ -z "$source_pkg" ]; then
-        source_pkg="$(
-            dpkg-query -W -f='${source:Package}\n' "linux-image-unsigned-${KVER}" 2>/dev/null |
-            head -1
-        )"
-    fi
-
+    source_pkg="$(running_source_field 'source:Package')"
     [ -n "$source_pkg" ] ||
         die "cannot determine the source package for kernel $KVER; pass --source-dir"
 
     src_list="$WORK/gfx803-deb-src.sources"
     lists_dir="$WORK/apt-lists"
-
+    rm -f "$src_list"
     mkdir -p "$lists_dir/partial"
 
     for list in \
@@ -308,8 +315,7 @@ fetch_source() {
                 sed 's/^Types:.*/Types: deb-src/' "$list" > "$src_list"
                 ;;
             *)
-                sed \
-                    -e '/^[[:space:]]*deb[[:space:]]/s/^[[:space:]]*deb[[:space:]]/deb-src /' \
+                sed -e '/^[[:space:]]*deb[[:space:]]/s/^[[:space:]]*deb[[:space:]]/deb-src /' \
                     "$list" > "$src_list"
                 ;;
         esac
@@ -318,109 +324,54 @@ fetch_source() {
     done
 
     [ -s "$src_list" ] ||
-        die "no Ubuntu apt source configuration available for deb-src"
+        die "no apt source configuration available for deb-src"
+
+    # Only the kernel deb-src indexes are fetched, into a private lists dir;
+    # the system's apt configuration is left untouched.
+    APT_SRC_OPTS=(
+        -o "Dir::Etc::sourcelist=$src_list"
+        -o "Dir::Etc::sourceparts=-"
+        -o "Dir::State::lists=$lists_dir"
+    )
 
     log "Updating only the kernel deb-src indexes"
-
-    apt-get update \
-        -o Dir::Etc::sourcelist="$src_list" \
-        -o Dir::Etc::sourceparts="-" \
-        -o Dir::State::lists="$lists_dir" \
-        -o APT::Get::List-Cleanup="0" \
-        </dev/null ||
+    apt-get "${APT_SRC_OPTS[@]}" -o APT::Get::List-Cleanup=0 update </dev/null ||
         die "failed to update the kernel deb-src indexes"
 
+    avail="$(source_versions "$source_pkg")"
+    [ -n "$avail" ] || die "no source versions found for $source_pkg"
+
     source_ver="$want"
+    case $'\n'"$avail"$'\n' in
+        *$'\n'"$want"$'\n'*)
+            ;;
+        *)
+            if [ "$ALLOW_MISMATCH" = 1 ]; then
+                source_ver="${avail%%$'\n'*}"
+                warn "exact source version $want is not available; using $source_pkg=$source_ver because --allow-source-mismatch was specified"
+            else
+                die "$source_pkg=$want is not available from the configured deb-src archives; pass --source-dir or --allow-source-mismatch"
+            fi
+            ;;
+    esac
 
-    if ! apt-cache \
-        -o Dir::Etc::sourcelist="$src_list" \
-        -o Dir::Etc::sourceparts="-" \
-        -o Dir::State::lists="$lists_dir" \
-        showsrc "${source_pkg}=${source_ver}" >/dev/null 2>&1
-    then
-        if [ "$ALLOW_MISMATCH" = 1 ]; then
-            source_ver="$(
-                apt-cache \
-                    -o Dir::Etc::sourcelist="$src_list" \
-                    -o Dir::Etc::sourceparts="-" \
-                    -o Dir::State::lists="$lists_dir" \
-                    showsrc "$source_pkg" 2>/dev/null |
-                awk -v pkg="$source_pkg" '
-                    $1 == "Package:" {
-                        found = ($2 == pkg)
-                        next
-                    }
-                    found && $1 == "Version:" {
-                        print $2
-                        exit
-                    }
-                '
-            )"
-
-            [ -n "$source_ver" ] ||
-                die "no source version is available for $source_pkg"
-
-            warn "exact source version $want is not available; using $source_pkg=$source_ver because --allow-source-mismatch was specified"
-        else
-            die "$source_pkg=$want is not available from the configured deb-src archives; pass --source-dir or --allow-source-mismatch"
-        fi
-    fi
-
+    rm -rf "$WORK/src"
     mkdir -p "$WORK/src"
     cd "$WORK/src"
 
-    log "Kernel source package: $source_pkg"
-    log "Kernel source version: $source_ver"
     log "Fetching kernel source package ${source_pkg}=${source_ver} (about 250 MB download)"
-
-    if ! apt-get \
-        -o Dir::Etc::sourcelist="$src_list" \
-        -o Dir::Etc::sourceparts="-" \
-        -o Dir::State::lists="$lists_dir" \
-        source "${source_pkg}=${source_ver}" </dev/null
-    then
-        if [ "$ALLOW_MISMATCH" = 1 ]; then
-            warn "${source_pkg}=${source_ver} is no longer in the archive; using the newest source"
-
-            apt-get \
-                -o Dir::Etc::sourcelist="$src_list" \
-                -o Dir::Etc::sourceparts="-" \
-                -o Dir::State::lists="$lists_dir" \
-                source "$source_pkg" </dev/null ||
-                die "failed to fetch the newest source package $source_pkg"
-        else
-            die "${source_pkg}=${source_ver} is not available from the archive. Pass --source-dir with the exact source, or --allow-source-mismatch to accept the newest one"
-        fi
-    fi
+    apt-get "${APT_SRC_OPTS[@]}" source "${source_pkg}=${source_ver}" </dev/null ||
+        die "failed to fetch ${source_pkg}=${source_ver}"
 
     out="$(
-        find "$WORK/src" \
-            -maxdepth 1 \
-            -mindepth 1 \
-            -type d \
-            -name 'linux*' |
-        head -1
+        find "$WORK/src" -maxdepth 1 -mindepth 1 -type d -name 'linux*' |
+        head -1 || true
     )"
-
-    [ -n "$out" ] ||
-        die "apt-get source produced no source directory"
+    [ -n "$out" ] || die "apt-get source produced no source directory"
 
     SRC_DIR="$out"
+    check_source_version
 
-    have="$(
-        dpkg-parsechangelog \
-            -l "$SRC_DIR/debian.master/changelog" \
-            -S Version 2>/dev/null || true
-    )"
-
-    want_base="${want%%~*}"
-
-    if [ -n "$have" ] &&
-       [ "$have" != "$want" ] &&
-       [ "$have" != "$want_base" ] &&
-       [ "$ALLOW_MISMATCH" = 0 ]; then
-        die "unpacked source is $have but the running kernel is $want"
-    fi
     log "Kernel source ready: $SRC_DIR"
     stage_done
 }
@@ -478,27 +429,23 @@ configure_tree() {
 
     log "Preparing kernel metadata for $KVER"
 
-    # IMPORTANT:
-    # modules_prepare is allowed to rewrite .config.
-    # Therefore DO NOT compare .config after modules_prepare.
+    # modules_prepare is allowed to rewrite .config, so .config is not
+    # compared afterwards.
     make -C "$SRC_DIR" \
         KERNELRELEASE="$KVER" \
         modules_prepare \
         >"$WORK/modules-prepare.log" 2>&1 || {
             tail -100 "$WORK/modules-prepare.log" >&2
-            die "modules_prepare failed"
+            die "modules_prepare failed; full log: $WORK/modules-prepare.log"
         }
 
     # Restore the exact running configuration AFTER modules_prepare.
     # Do NOT run modules_prepare again.
     cp -f "$running_config" .config
-
-    # Restore the exact Module.symvers as well.
     cp -f "$headers/Module.symvers" Module.symvers
 
-    # Verify required configuration symbols.
     grep -qx 'CONFIG_DRM_AMDGPU=m' .config ||
-        die "CONFIG_DRM_AMDGPU is not=m"
+        die "CONFIG_DRM_AMDGPU is not =m"
 
     grep -qx 'CONFIG_HSA_AMD=y' .config ||
         die "CONFIG_HSA_AMD is not enabled"
@@ -517,11 +464,11 @@ configure_tree() {
 
     log "Kernel configuration verified"
     log "  KERNELRELEASE = $KVER"
-    log "  CONFIG_DRM_AMDGPU = $(grep '^CONFIG_DRM_AMDGPU=' .config)"
-    log "  CONFIG_HSA_AMD = $(grep '^CONFIG_HSA_AMD=' .config)"
-    log "  CONFIG_MODVERSIONS = $(grep '^CONFIG_MODVERSIONS=' .config)"
-    log "  CONFIG_LTO_NONE = $(grep '^CONFIG_LTO_NONE=' .config)"
-    log "  CONFIG_MODULES_USE_ELF_RELA = $(grep '^CONFIG_MODULES_USE_ELF_RELA=' .config)"
+    log "  $(grep '^CONFIG_DRM_AMDGPU=' .config)"
+    log "  $(grep '^CONFIG_HSA_AMD=' .config)"
+    log "  $(grep '^CONFIG_MODVERSIONS=' .config)"
+    log "  $(grep '^CONFIG_LTO_NONE=' .config)"
+    log "  $(grep '^CONFIG_MODULES_USE_ELF_RELA=' .config)"
     stage_done
 }
 
@@ -536,13 +483,10 @@ build_module() {
         KERNELRELEASE="$KVER" \
         M=drivers/gpu/drm/amd/amdgpu \
         clean \
-        >"$WORK/clean.log" 2>&1 ||
-        {
+        >"$WORK/clean.log" 2>&1 || {
             tail -30 "$WORK/clean.log" >&2
             die "amdgpu clean failed; full log: $WORK/clean.log"
         }
-
-    log "DONE: amdgpu clean"
 
     log "BUILD 2/2: Building amdgpu.ko with $JOBS parallel job(s)"
 
@@ -551,8 +495,7 @@ build_module() {
         -j"$JOBS" \
         M=drivers/gpu/drm/amd/amdgpu \
         modules \
-        >"$WORK/build.log" 2>&1 ||
-        {
+        >"$WORK/build.log" 2>&1 || {
             tail -50 "$WORK/build.log" >&2
             die "module build failed; full log: $WORK/build.log"
         }
@@ -560,9 +503,7 @@ build_module() {
     [ -f "$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko" ] ||
         die "make returned successfully but amdgpu.ko is missing"
 
-    log "PASS: amdgpu.ko was produced"
-    log "Build log: $WORK/build.log"
-
+    log "PASS: amdgpu.ko was produced (build log: $WORK/build.log)"
     stage_done
 }
 
@@ -571,20 +512,15 @@ verify_module() {
 
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
     local kfd_src="$SRC_DIR/drivers/gpu/drm/amd/amdkfd/kfd_device.c"
-    local vermagic
-    local generated_release
-    local relocation
-    local expected_exit_offset
-    local expected_relocation
+    local vermagic generated_release relocation
+    local expected_exit_offset expected_relocation
 
     log "VERIFY 1/8: amdgpu.ko exists"
-    [ -f "$ko" ] ||
-        die "amdgpu.ko was not produced: $ko"
+    [ -f "$ko" ] || die "amdgpu.ko was not produced: $ko"
     log "PASS: amdgpu.ko exists"
 
     log "VERIFY 2/8: KFD source exists"
-    [ -f "$kfd_src" ] ||
-        die "KFD source is missing: $kfd_src"
+    [ -f "$kfd_src" ] || die "KFD source is missing: $kfd_src"
     log "PASS: KFD source exists"
 
     log "VERIFY 3/8: UTS_RELEASE"
@@ -593,71 +529,53 @@ verify_module() {
             's/^#define UTS_RELEASE "\(.*\)"/\1/p' \
             "$SRC_DIR/include/generated/utsrelease.h"
     )"
-
     [ "$generated_release" = "$KVER" ] ||
         die "module tree UTS_RELEASE '$generated_release' does not match '$KVER'"
-
     log "PASS: UTS_RELEASE=$generated_release"
 
     log "VERIFY 4/8: module vermagic"
     vermagic="$(modinfo -F vermagic "$ko")"
-
-    printf '%s\n' "$vermagic" |
-        grep -q "^${KVER} " ||
+    printf '%s\n' "$vermagic" | grep -q "^${KVER} " ||
         die "vermagic '$vermagic' does not start with '$KVER'"
-
     log "PASS: vermagic=$vermagic"
 
     log "VERIFY 5/8: Polaris10 KFD PCI-atomics exemption"
-
     grep -q 'asic_type != CHIP_POLARIS10' "$kfd_src" ||
         die "KFD source does not contain the Polaris10 PCI-atomics exemption"
-
     grep -q 'asic_type != CHIP_HAWAII &&' "$kfd_src" ||
         die "KFD source does not contain the expected atomics gate"
-
     grep -q 'kfd->device_info.needs_pci_atomics = true' "$kfd_src" ||
         die "KFD source has no PCI-atomics gate; wrong kernel tree"
-
     log "PASS: Polaris10 PCI-atomics exemption is present"
 
     log "VERIFY 6/8: readelf relocation table"
-
     if ! readelf -rW "$ko" >"$WORK/amdgpu-relocations.txt" 2>"$WORK/readelf.err"; then
         cat "$WORK/readelf.err" >&2
         die "readelf failed for $ko"
     fi
-
     log "PASS: relocation table readable"
 
     log "VERIFY 7/8: cleanup_module relocation"
-
     expected_exit_offset="$(
-        pahole -C module /sys/kernel/btf/vmlinux |
-            sed -n \
-                's/.*void[[:space:]]\+(\*exit)(void);[[:space:]]*\/\*[[:space:]]*\([0-9]\+\).*/\1/p' |
-            head -1
+        pahole -C module /sys/kernel/btf/vmlinux 2>/dev/null |
+            sed -n 's/.*void[[:space:]]\+(\*exit)(void);[[:space:]]*\/\*[[:space:]]*\([0-9]\+\).*/\1/p' |
+            head -1 || true
     )"
-
     [ -n "$expected_exit_offset" ] ||
         die "unable to determine struct module.exit offset from running kernel BTF"
 
-    expected_relocation="$(
-        printf '%x' "$expected_exit_offset"
-    )"
+    expected_relocation="$(printf '%x' "$expected_exit_offset")"
 
     relocation="$(
-        awk ' 
-            /\.rela\.gnu\.linkonce\.this_module/ { 
-                in_section=1 
-                next 
+        awk '
+            /\.rela\.gnu\.linkonce\.this_module/ {
+                in_section = 1
+                next
             }
-
             in_section && /cleanup_module/ {
                 print $1
                 exit
             }
-
             in_section &&
             /^Relocation section / &&
             !/\.rela\.gnu\.linkonce\.this_module/ {
@@ -665,33 +583,41 @@ verify_module() {
             }
         ' "$WORK/amdgpu-relocations.txt"
     )"
+    [ -n "$relocation" ] || die "unable to determine cleanup_module relocation"
 
-    [ -n "$relocation" ] ||
-        die "unable to determine cleanup_module relocation"
-
-    relocation="$(
-        printf '%x' "$((16#$relocation))"
-    )"
+    relocation="$(printf '%x' "$((16#$relocation))")"
 
     [ "$relocation" = "$expected_relocation" ] ||
-        die \
-            "unexpected cleanup_module relocation '0x$relocation'; expected '0x$expected_relocation' from running kernel BTF"
-
-    log "PASS: cleanup_module relocation=0x$relocation matches running kernel struct module.exit=0x$expected_relocation"
+        die "unexpected cleanup_module relocation '0x$relocation'; expected '0x$expected_relocation' from running kernel BTF"
+    log "PASS: cleanup_module relocation=0x$relocation matches running kernel struct module.exit"
 
     log "VERIFY 8/8: module metadata"
-
     log "  file: $(file "$ko")"
-    log "  size: $(du -h "$ko" | awk '{print $1}')"
-
+    log "  size: $(du -h "$ko" | awk '{print $1}') (before strip)"
     log "PASS: module metadata"
 
-    log "Verified patched KFD source for Polaris10"
-    log "Verified UTS_RELEASE: $generated_release"
-    log "Verified vermagic: $vermagic"
-    log "Verified struct module cleanup_module relocation: 0x$relocation"
     log "Built: $ko"
+    stage_done
+}
 
+# The build keeps full debug info (hundreds of MB). The stock module is
+# stripped, so do the same. This MUST run before signing: stripping a signed
+# module would invalidate the signature.
+strip_module() {
+    stage_start "strip_module"
+    local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko" before after
+
+    before="$(stat -c %s "$ko")"
+    strip --strip-debug "$ko"
+    after="$(stat -c %s "$ko")"
+    log "Stripped debug info: $((before / 1048576)) MB -> $((after / 1048576)) MB"
+
+    modinfo -F vermagic "$ko" | grep -q "^${KVER} " ||
+        die "vermagic broke after strip"
+
+    if ! grep -aq "PCI rejects atomics" "$ko"; then
+        warn "the 'PCI rejects atomics' string is not in the stripped module (message text may differ in this kernel); the source-level checks passed"
+    fi
     stage_done
 }
 
@@ -727,8 +653,7 @@ sign_module() {
             stage_done
             return 0
         fi
-
-        die "Secure Boot is enabled; signing key and certificate are required"
+        die "Secure Boot is enabled; signing key and certificate are required (--sign-key / --sign-cert)"
     fi
 
     mokutil --test-key "$SIGN_CERT" 2>&1 |
@@ -736,16 +661,28 @@ sign_module() {
         die "$SIGN_CERT is not enrolled in the MOK list"
 
     log "Signing amdgpu.ko"
-
     "/usr/src/linux-headers-${KVER}/scripts/sign-file" \
-        sha512 \
-        "$SIGN_KEY" \
-        "$SIGN_CERT" \
-        "$ko"
+        sha512 "$SIGN_KEY" "$SIGN_CERT" "$ko"
 
     log "PASS: module signed"
-
     stage_done
+}
+
+# Use the same compression as the stock module so the host's kmod and the
+# initramfs can read it. Signing happens before compression, as Ubuntu does.
+stock_compression() {
+    local stock
+    stock="$(
+        find "/lib/modules/${KVER}/kernel/drivers/gpu/drm/amd/amdgpu" \
+            -maxdepth 1 -name 'amdgpu.ko*' 2>/dev/null |
+        head -1 || true
+    )"
+    case "$stock" in
+        *.zst) echo zst ;;
+        *.xz)  echo xz ;;
+        *.gz)  echo gz ;;
+        *)     echo none ;;
+    esac
 }
 
 # `updates/` outranks `kernel/` in depmod's search order, which leaves the stock
@@ -754,59 +691,109 @@ install_module() {
     stage_start "install_module"
 
     local ko="$SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
-    local dest="/lib/modules/${KVER}/updates/amdgpu.ko"
+    local dir="/lib/modules/${KVER}/updates"
+    local dest img n resolved
 
-    log "Installing: $dest"
+    mkdir -p "$dir"
+    rm -f "$dir"/amdgpu.ko "$dir"/amdgpu.ko.*
 
-    install -D -m 0644 "$ko" "$dest"
+    case "$(stock_compression)" in
+        zst)
+            dest="$dir/amdgpu.ko.zst"
+            zstd -q -19 -T0 -f "$ko" -o "$dest"
+            ;;
+        xz)
+            dest="$dir/amdgpu.ko.xz"
+            xz -c --check=crc32 -6 "$ko" > "$dest"
+            ;;
+        gz)
+            dest="$dir/amdgpu.ko.gz"
+            gzip -9 -c "$ko" > "$dest"
+            ;;
+        *)
+            dest="$dir/amdgpu.ko"
+            install -D -m 0644 "$ko" "$dest"
+            ;;
+    esac
+    chmod 0644 "$dest"
+    log "Installed $dest ($(( $(stat -c %s "$dest") / 1048576 )) MB)"
 
     log "Running depmod"
     depmod -a "$KVER"
 
-    local resolved
     resolved="$(modinfo -k "$KVER" -n amdgpu)"
-
     log "depmod resolves amdgpu to: $resolved"
-
     [ "$resolved" = "$dest" ] ||
-        die "depmod still resolves amdgpu to $resolved, not $dest"
-
+        die "depmod resolves amdgpu to $resolved, not $dest"
     log "PASS: installed module is preferred by depmod"
+
+    # Safety net: load amdgpu on every boot even if udev autoload misses it.
+    printf 'amdgpu\n' > /etc/modules-load.d/gfx803-amdgpu.conf
+    log "Wrote /etc/modules-load.d/gfx803-amdgpu.conf"
 
     if [ "$DO_INITRAMFS" = 1 ]; then
         log "Rebuilding initramfs"
         update-initramfs -u -k "$KVER"
-        log "PASS: initramfs rebuilt"
+        img="/boot/initrd.img-${KVER}"
+        if [ -f "$img" ] && command -v lsinitramfs >/dev/null; then
+            n="$(lsinitramfs "$img" | grep -c 'updates/amdgpu\.ko' || true)"
+            if [ "${n:-0}" -ge 1 ]; then
+                log "PASS: initramfs contains the patched amdgpu ($(( $(stat -c %s "$img") / 1048576 )) MB)"
+            else
+                warn "the patched amdgpu is NOT inside $img; the stock module may load first"
+            fi
+        fi
     else
         log "Initramfs rebuild skipped (--no-initramfs)"
     fi
 
     log "Installed module:"
     modinfo -k "$KVER" amdgpu |
-        grep -E '^(filename|version|vermagic|srcversion):'
+        grep -E '^(filename|version|vermagic|srcversion):' || true
 
     stage_done
 }
 
 uninstall_module() {
-    local dest="/lib/modules/${KVER}/updates/amdgpu.ko"
+    local dir="/lib/modules/${KVER}/updates" found=0 f
 
-    if [ -f "$dest" ]; then
-        rm -f "$dest"
-        rmdir \
-            --ignore-fail-on-non-empty \
-            "/lib/modules/${KVER}/updates" \
-            2>/dev/null || true
+    for f in "$dir"/amdgpu.ko "$dir"/amdgpu.ko.*; do
+        if [ -f "$f" ]; then
+            rm -f "$f"
+            found=1
+        fi
+    done
+    rm -f /etc/modules-load.d/gfx803-amdgpu.conf
+    rmdir --ignore-fail-on-non-empty "$dir" 2>/dev/null || true
 
+    if [ "$found" = 1 ]; then
         depmod -a "$KVER"
-
-        [ "$DO_INITRAMFS" = 1 ] &&
+        if [ "$DO_INITRAMFS" = 1 ]; then
             update-initramfs -u -k "$KVER"
-
-        log "Removed $dest; the stock amdgpu loads again after a reboot"
+        fi
+        log "Removed the patched amdgpu; the stock one loads again after a reboot"
     else
-        log "Nothing to remove: $dest does not exist"
+        log "Nothing to remove under $dir"
     fi
+}
+
+# The kernel source and build objects take several GB. Only a tree this script
+# downloaded itself is removed, never a --source-dir the user supplied.
+cleanup_build_tree() {
+    if [ "$KEEP_WORKDIR" = 1 ]; then
+        log "Keeping build tree under $WORK (--keep-workdir)"
+        return 0
+    fi
+    case "$SRC_DIR" in
+        "$WORK"/src/*)
+            log "Removing build tree $WORK/src (use --keep-workdir to keep it)"
+            cd /
+            rm -rf "$WORK/src" "$WORK/apt-lists"
+            ;;
+        *)
+            log "Not removing $SRC_DIR (not downloaded by this script)"
+            ;;
+    esac
 }
 
 print_next_steps() {
@@ -815,13 +802,16 @@ print_next_steps() {
 Done. The running amdgpu drives the display and cannot be swapped live, so
 reboot to load the new module. Afterwards:
 
+    lsmod | grep amdgpu
+    modinfo -n amdgpu
     sudo dmesg | grep -i -E 'kfd|atomic'
     ls /sys/class/kfd/kfd/topology/nodes
 
-A KFD node for the RX 580 (device_id 26591 in its 'properties' file) means the
-gate is gone. Kernel updates install a fresh stock module under kernel/, and
-the one from this script only covers ${KVER}: run the script again after each
-kernel update. To go back to the stock module:
+amdgpu should be loaded without a manual modprobe. A KFD node for the RX 580
+(device_id 26591 in its 'properties' file) means the gate is gone. Kernel
+updates install a fresh stock module under kernel/, and the one from this
+script only covers ${KVER}: run the script again after each kernel update.
+To go back to the stock module:
 
     sudo bash host-amdgpu-kfd-polaris10.sh --uninstall
 
@@ -846,9 +836,7 @@ main() {
 
     if [ "$UNINSTALL" = 1 ]; then
         uninstall_module
-        log "============================================================"
         log "ALL DONE: uninstall completed"
-        log "============================================================"
         return 0
     fi
 
@@ -866,19 +854,18 @@ main() {
     configure_tree
     build_module
     verify_module
+    strip_module
     sign_module
 
     if [ "$BUILD_ONLY" = 1 ]; then
         log "Build-only mode: installation skipped"
-        log "Module:"
-        log "  $SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
-        log "============================================================"
+        log "Module: $SRC_DIR/drivers/gpu/drm/amd/amdgpu/amdgpu.ko"
         log "ALL DONE: BUILD + VERIFY completed successfully"
-        log "============================================================"
         return 0
     fi
 
     install_module
+    cleanup_build_tree
     print_next_steps
 
     log "============================================================"
